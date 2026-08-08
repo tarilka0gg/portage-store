@@ -18,6 +18,17 @@
   filter: brightness(1.08);
 }
 
+/* A search-result card's "also available via Flatpak" badge — an
+   accent-tinted pill rather than plain text, so it reads as a distinct
+   source tag at a glance instead of blending into the description. */
+.source-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.12);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
 /* The detail page's Install/Remove button while its own job is running
    (see `App::start_next` in mod.rs) — a light band sweeping left to right
    over the button's own colour, the same "still working" read as the

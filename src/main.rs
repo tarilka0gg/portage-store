@@ -1,3 +1,5 @@
+mod backend;
+mod flatpak;
 mod portage;
 mod ui;
 

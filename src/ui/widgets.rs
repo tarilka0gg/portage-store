@@ -1,7 +1,7 @@
 use crate::portage::eix::PackageSummary;
 use crate::portage::icons;
 use crate::portage::installed::InstalledPackage;
-use gtk::prelude::*;
+use adw::prelude::*;
 use std::collections::HashMap;
 
 /// One named section of the landing page's featured area: a theme (Social,
@@ -457,6 +457,40 @@ pub fn package_card(
     button.add_css_class("package-card");
     button.set_tooltip_text(Some(&pkg.atom()));
     (button, icon)
+}
+
+/// Adds a small "Also on Flatpak" pill to an already-built `package_card`
+/// — purely additive metadata on a card that's still, fundamentally, the
+/// Portage result. Called only when `backend::merge_search_results` found
+/// a confident match, never unconditionally, so a card never claims a
+/// Flatpak build exists when the merge wasn't sure enough to say so.
+pub fn add_flatpak_chip(card: &gtk::Button) {
+    let Some(row) = card.child().and_downcast::<gtk::Box>() else { return };
+    let chip = gtk::Label::new(Some(&format!("Also on {}", crate::backend::SourceId::Flatpak.label())));
+    chip.add_css_class("source-chip");
+    chip.set_valign(gtk::Align::Center);
+    row.insert_child_after(&chip, row.last_child().as_ref());
+}
+
+/// A card for a Flatpak-only search hit — the "Also available via
+/// Flatpak" section's own rows, which never had a Portage result to piggy
+/// back a chip onto. Deliberately a plainer `ActionRow`, not a full grid
+/// card: this section is meant to read as a secondary, optional list
+/// tucked below the real (Portage) results, not visually competing with
+/// them for attention.
+pub fn flatpak_only_row(app: &crate::flatpak::FlatpakApp, already_installed: bool) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(&app.name).subtitle(&app.description).build();
+    row.add_prefix(&gtk::Image::from_icon_name("package-x-generic-symbolic"));
+    let chip_text = if already_installed { "Installed".to_string() } else { crate::backend::SourceId::Flatpak.label().to_string() };
+    let chip = gtk::Label::new(Some(&chip_text));
+    chip.add_css_class("source-chip");
+    chip.set_valign(gtk::Align::Center);
+    row.add_suffix(&chip);
+    // Already-installed rows aren't a "tap to install" affordance —
+    // this pass has no uninstall/manage flow for Flatpak apps yet, so
+    // there's nothing useful for a tap to do here.
+    row.set_activatable(!already_installed);
+    row
 }
 
 /// Loads `name` straight from Papirus's own symbolic category icons rather

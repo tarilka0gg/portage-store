@@ -12,6 +12,8 @@ mod settings;
 mod webview;
 mod widgets;
 
+use crate::backend;
+use crate::flatpak;
 use crate::portage::eix::{self, PackageSummary};
 use crate::portage::emerge::{self, Job};
 use crate::portage::config_protect::PendingUpdate;
@@ -51,6 +53,16 @@ struct QueueEntry {
     /// long enough (see `START_ETA_MIN_SECONDS`) for an upfront ETA to
     /// actually be worth showing.
     known_atoms: Vec<String>,
+}
+
+/// A queued Flatpak job — much simpler than `QueueEntry`: no USE-flag
+/// relaxation retry (Flatpak has no USE flags), no ETA (Flatpak installs
+/// are minutes, not hours — see `Caps::shows_build_time`), and mutation
+/// tracking isn't needed since the Flatpak "installed" list is re-scanned
+/// fresh on every completion regardless.
+struct FlatpakQueueEntry {
+    job: Job,
+    label: String,
 }
 
 /// One of the three "you need to relax something to proceed" blocks
@@ -189,6 +201,36 @@ pub struct App {
     /// instantly (`render_filtered_results`) without re-running `eix`.
     last_results: RefCell<Vec<eix::PackageSummary>>,
     search_filters: RefCell<eix::SearchFilters>,
+    /// Whether the Flatpak backend is even worth asking — `flatpak.rs`'s
+    /// own auto-detection (binary present, at least one remote), checked
+    /// once at startup rather than on every keystroke.
+    flatpak_available: Cell<bool>,
+    /// Cards currently on screen in `results_grid`, keyed by atom — a
+    /// Flatpak search match arriving after Portage's own results are
+    /// already drawn needs to find the right card to pin a chip onto
+    /// (`widgets::add_flatpak_chip`) without re-rendering the grid.
+    search_cards: RefCell<HashMap<String, gtk::Button>>,
+    /// Holds the collapsed "Also available via Flatpak" group beneath the
+    /// main results — a Flatpak-only hit never gets a card of its own in
+    /// `results_grid`, which stays Portage-authoritative.
+    flatpak_section: gtk::Box,
+    /// The last `backend::merge_search_results` outcome's chip mapping —
+    /// consulted every time `render_filtered_results` rebuilds cards
+    /// (e.g. a filter changing), since a fresh rebuild otherwise loses
+    /// whatever chips `apply_flatpak_results` had already pinned on.
+    flatpak_chips: RefCell<HashMap<String, Vec<flatpak::FlatpakApp>>>,
+
+    /// A second, independent job lane for Flatpak installs/updates/
+    /// removals. Deliberately not the same `queue`/`running` a Portage
+    /// job uses: Portage's global lock means only one `emerge` can ever
+    /// run at a time, but Flatpak has no such lock — sharing one FIFO
+    /// would make a Flatpak update wait behind an hours-long `@world`
+    /// rebuild for no real reason.
+    flatpak_queue: RefCell<VecDeque<FlatpakQueueEntry>>,
+    flatpak_running: Cell<bool>,
+    flatpak_job_revealer: gtk::Revealer,
+    flatpak_job_label: gtk::Label,
+    flatpak_job_progress: gtk::ProgressBar,
 
     installed_grid: gtk::FlowBox,
     installed_stack: gtk::Stack,
@@ -661,10 +703,20 @@ impl App {
         let results_grid = widgets::grid();
         let results_spinner = gtk::Spinner::new();
         results_spinner.set_halign(gtk::Align::Center);
+
+        // The "Also available via Flatpak" section — a Flatpak-only
+        // search hit never gets a card in `results_grid` itself, which
+        // stays exclusively Portage's. Empty (and so invisible — a
+        // `gtk::Box` with no children takes up no space) until a search
+        // actually turns up something Flatpak-only.
+        let flatpak_section = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        flatpak_section.set_margin_top(16);
+
         let results = page_box();
         results.append(&results_heading_row);
         results.append(&results_spinner);
         results.append(&results_grid);
+        results.append(&flatpak_section);
 
         let explore_stack = gtk::Stack::new();
         explore_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
@@ -880,6 +932,37 @@ impl App {
 
         let job_revealer = gtk::Revealer::builder().child(&job_box).build();
 
+        // --- Flatpak job bar --------------------------------------------
+        // A second, thinner bar rather than reusing `job_box`: Flatpak
+        // jobs run on their own lock domain (see `flatpak_queue` on
+        // `App`) and can be going on *at the same time* as a Portage job
+        // — one shared bar could only ever show one of the two.
+        let flatpak_job_label = gtk::Label::new(None);
+        flatpak_job_label.set_xalign(0.0);
+        flatpak_job_label.add_css_class("caption-heading");
+
+        let flatpak_job_progress = gtk::ProgressBar::new();
+        flatpak_job_progress.set_show_text(true);
+
+        let flatpak_job_spinner = gtk::Spinner::new();
+        flatpak_job_spinner.start();
+        flatpak_job_spinner.set_valign(gtk::Align::Center);
+
+        let flatpak_job_text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        flatpak_job_text.set_hexpand(true);
+        flatpak_job_text.append(&flatpak_job_label);
+        flatpak_job_text.append(&flatpak_job_progress);
+
+        let flatpak_job_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        flatpak_job_box.set_margin_top(6);
+        flatpak_job_box.set_margin_bottom(6);
+        flatpak_job_box.set_margin_start(14);
+        flatpak_job_box.set_margin_end(14);
+        flatpak_job_box.append(&flatpak_job_spinner);
+        flatpak_job_box.append(&flatpak_job_text);
+
+        let flatpak_job_revealer = gtk::Revealer::builder().child(&flatpak_job_box).build();
+
         // Gentoo news is a GLEP-42 announcement channel for changes that
         // can break a system if missed (a profile migration, a dropped
         // default) — `emerge`/`eix` print a one-line reminder about
@@ -915,6 +998,7 @@ impl App {
         toolbar.add_top_bar(&sync_banner);
         toolbar.set_content(Some(&view_stack));
         toolbar.add_bottom_bar(&job_revealer);
+        toolbar.add_bottom_bar(&flatpak_job_revealer);
 
         let main_page = adw::NavigationPage::builder()
             .title("Portage Store")
@@ -1016,6 +1100,15 @@ impl App {
             filter_button,
             last_results: RefCell::new(Vec::new()),
             search_filters: RefCell::new(eix::SearchFilters::default()),
+            flatpak_available: Cell::new(false),
+            search_cards: RefCell::new(HashMap::new()),
+            flatpak_section,
+            flatpak_chips: RefCell::new(HashMap::new()),
+            flatpak_queue: RefCell::new(VecDeque::new()),
+            flatpak_running: Cell::new(false),
+            flatpak_job_revealer,
+            flatpak_job_label,
+            flatpak_job_progress,
             installed_grid,
             installed_stack,
             installed_scroller,
@@ -1088,6 +1181,13 @@ impl App {
         {
             let popover = app.build_filter_popover();
             app.filter_button.set_popover(Some(&popover));
+        }
+        {
+            // Checked once, off the main thread — `flatpak::is_available`
+            // shells out twice (`which`, `flatpak remotes`) and there's no
+            // reason to pay that cost on every search.
+            let app = app.clone();
+            runtime::spawn_blocking(flatpak::is_available, move |available| app.flatpak_available.set(available));
         }
         app.install_header_gesture(&header);
         app.install_window_actions();
@@ -1787,13 +1887,15 @@ impl App {
         self.results_heading.set_text(&format!("Results for \u{201c}{query}\u{201d}"));
         self.explore_stack.set_visible_child_name("results");
         widgets::clear(&self.results_grid);
+        self.clear_flatpak_section();
         self.results_spinner.start();
         self.results_spinner.set_visible(true);
         self.scroll_to_top();
 
         let app = self.clone();
+        let query_for_portage = query.clone();
         runtime::spawn_blocking(
-            move || eix::search(&query).map_err(|e| e.to_string()),
+            move || eix::search(&query_for_portage).map_err(|e| e.to_string()),
             move |result| {
                 if generation != app.search_generation.get() {
                     return;
@@ -1801,6 +1903,27 @@ impl App {
                 app.show_results(result);
             },
         );
+
+        // Runs fully in parallel with the Portage search above, on its
+        // own `spawn_blocking` call — never gates or delays Portage's own
+        // render. Whenever it finishes (typically a few hundred ms, but
+        // nothing here waits on that), `apply_flatpak_results` only adds
+        // chips to cards already on screen and appends the "Also
+        // available via Flatpak" section — it never reorders or replaces
+        // what Portage already drew, so a slow Flatpak search can't make
+        // already-visible results jump around.
+        if self.flatpak_available.get() {
+            let app = self.clone();
+            runtime::spawn_blocking(
+                move || (flatpak::search(&query).unwrap_or_default(), flatpak::installed().unwrap_or_default()),
+                move |(hits, installed)| {
+                    if generation != app.search_generation.get() {
+                        return;
+                    }
+                    app.apply_flatpak_results(hits, installed);
+                },
+            );
+        }
     }
 
     fn browse_category(self: &Rc<Self>, name: &'static str, categories: &'static [&'static str]) {
@@ -1812,6 +1935,10 @@ impl App {
         self.results_heading.set_text(name);
         self.explore_stack.set_visible_child_name("results");
         widgets::clear(&self.results_grid);
+        // Category browsing is a curated, Portage-only showcase (like the
+        // landing carousels) — it never gets a Flatpak layer, so any
+        // leftover section from a previous free-text search is dropped.
+        self.clear_flatpak_section();
         self.results_spinner.start();
         self.results_spinner.set_visible(true);
         self.scroll_to_top();
@@ -1869,6 +1996,7 @@ impl App {
     fn browsing_landing(self: &Rc<Self>) {
         self.search_generation.set(self.search_generation.get() + 1);
         self.explore_stack.set_visible_child_name("landing");
+        self.clear_flatpak_section();
         self.scroll_to_top();
     }
 
@@ -1914,12 +2042,77 @@ impl App {
 
         let installed = self.installed.borrow();
         let icons = self.icon_paths.borrow();
+        let mut cards = HashMap::new();
+        let chips = self.flatpak_chips.borrow();
         for pkg in filtered.into_iter().take(300) {
             let (card, _icon) = widgets::package_card(&pkg, &installed, &icons);
+            if chips.contains_key(&pkg.atom()) {
+                widgets::add_flatpak_chip(&card);
+            }
+            cards.insert(pkg.atom(), card.clone());
             self.connect_card(&card, pkg);
             self.results_grid.insert(&card, -1);
         }
+        drop(chips);
+        *self.search_cards.borrow_mut() = cards;
         self.scroll_to_top();
+    }
+
+    fn clear_flatpak_section(&self) {
+        while let Some(child) = self.flatpak_section.first_child() {
+            self.flatpak_section.remove(&child);
+        }
+        self.flatpak_chips.borrow_mut().clear();
+    }
+
+    /// Reconciles a Flatpak search's hits against the Portage results
+    /// already on screen (`backend::merge_search_results`): pins a
+    /// "Also on Flatpak" chip onto every card with a confident match, and
+    /// renders the rest as a collapsed section beneath the grid. Never
+    /// touches `results_grid` itself — see `run_search` for why that
+    /// matters.
+    fn apply_flatpak_results(self: &Rc<Self>, hits: Vec<flatpak::FlatpakApp>, installed: HashMap<String, flatpak::InstalledFlatpak>) {
+        let merged = backend::merge_search_results(&self.last_results.borrow(), &hits);
+        let cards = self.search_cards.borrow();
+        for atom in merged.chips.keys() {
+            if let Some(card) = cards.get(atom) {
+                widgets::add_flatpak_chip(card);
+            }
+        }
+        drop(cards);
+        *self.flatpak_chips.borrow_mut() = merged.chips;
+
+        self.clear_flatpak_section_only_content();
+        if merged.flatpak_only.is_empty() {
+            return;
+        }
+        let boxed_list = gtk::ListBox::new();
+        boxed_list.add_css_class("boxed-list");
+        let expander = adw::ExpanderRow::builder()
+            .title(format!("Also available via Flatpak ({})", merged.flatpak_only.len()))
+            .build();
+        for app in &merged.flatpak_only {
+            let already_installed = installed.contains_key(&app.app_id);
+            let row = widgets::flatpak_only_row(app, already_installed);
+            if !already_installed {
+                let app_for_click = app.clone();
+                let this = self.clone();
+                row.connect_activated(move |_| this.present_flatpak_detail(app_for_click.clone()));
+            }
+            expander.add_row(&row);
+        }
+        boxed_list.append(&expander);
+        self.flatpak_section.append(&boxed_list);
+    }
+
+    /// Like `clear_flatpak_section`, but leaves `flatpak_chips` alone —
+    /// `apply_flatpak_results` just repopulated it and clears the section
+    /// widget itself right after, so wiping the map it only just set
+    /// would be self-defeating.
+    fn clear_flatpak_section_only_content(&self) {
+        while let Some(child) = self.flatpak_section.first_child() {
+            self.flatpak_section.remove(&child);
+        }
     }
 
     /// The funnel popover next to search results: USE flag presence,
@@ -2238,6 +2431,117 @@ impl App {
         popover.set_parent(anchor);
         popover.connect_closed(|popover| popover.unparent());
         popover.popup();
+    }
+
+    /// Opens a small confirm-and-install dialog for a Flatpak-only search
+    /// hit. Deliberately not routed through `detail.rs` — that page is
+    /// built entirely around Portage concepts (USE flags, `--pretend`
+    /// previews, sandbox builds) that don't apply here, and forcing a
+    /// Flatpak app through it would mean either a page half full of
+    /// disabled Portage-only controls or a much larger rewrite of that
+    /// page than this pass is scoped for.
+    fn present_flatpak_detail(self: &Rc<Self>, app: flatpak::FlatpakApp) {
+        // Fetched before the dialog even opens — showing "Install" with
+        // no size, then having a 1-2 GB runtime download turn out to be
+        // part of it, is exactly the "your warning will lie" failure
+        // mode a Flatpak-aware download size figure exists to avoid.
+        let this = self.clone();
+        let app_for_lookup = app.clone();
+        runtime::spawn_blocking(
+            move || flatpak::remote_info_size(&app_for_lookup.remote, &app_for_lookup.app_id).and_then(|(download, _)| download),
+            move |download_kib| this.present_flatpak_confirm(app.clone(), download_kib),
+        );
+    }
+
+    fn present_flatpak_confirm(self: &Rc<Self>, app: flatpak::FlatpakApp, download_kib: Option<u64>) {
+        // Driven by `Caps`, not hardcoded prose about Flatpak specifically
+        // — this is exactly the sentence that would need to change (or
+        // vanish) if a third, root-needing backend ever reused this same
+        // confirm dialog.
+        let caps = backend::SourceId::Flatpak.caps();
+        let trust_line = if caps.sandboxed && !caps.needs_root {
+            "Installs sandboxed, as your own user — no admin password needed."
+        } else {
+            "Installs on this system."
+        };
+        let mut body = if app.description.is_empty() { trust_line.to_string() } else { format!("{}\n\n{trust_line}", app.description) };
+        if let Some(kib) = download_kib {
+            body.push_str(&format!("\n\nDownload size: {} (may include a shared runtime not yet on this machine).", emerge::format_size_kib(kib)));
+        }
+        let dialog = adw::AlertDialog::new(Some(&app.name), Some(&body));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("install", "Install");
+        dialog.set_response_appearance("install", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("install"));
+        dialog.set_close_response("cancel");
+
+        let this = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response != "install" {
+                return;
+            }
+            let this = this.clone();
+            let app = app.clone();
+            runtime::spawn_blocking(
+                move || flatpak::ensure_user_flathub().map(|()| app).map_err(|e| e.to_string()),
+                move |result| match result {
+                    Ok(app) => this.enqueue_flatpak(FlatpakQueueEntry {
+                        job: flatpak::install_job(&app.remote, &app.app_id),
+                        label: format!("Installing {} (Flatpak)", app.name),
+                    }),
+                    Err(err) => this.toast(&format!("Couldn't set up Flatpak: {err}")),
+                },
+            );
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn enqueue_flatpak(self: &Rc<Self>, entry: FlatpakQueueEntry) {
+        let label = entry.label.clone();
+        self.flatpak_queue.borrow_mut().push_back(entry);
+        if self.flatpak_running.get() {
+            let pending = self.flatpak_queue.borrow().len();
+            self.toast(&format!("{label} — queued ({pending})"));
+        } else {
+            self.start_next_flatpak();
+        }
+    }
+
+    /// Flatpak's own lock domain — see `flatpak_queue` on `App`. Mirrors
+    /// `start_next` in shape but with none of the Portage-specific
+    /// machinery (no ETA, no USE-flag retry, no resource throttling —
+    /// none of it applies to a rootless, sandboxed, already-prebuilt
+    /// install) and can run at the same time as a Portage job is going.
+    fn start_next_flatpak(self: &Rc<Self>) {
+        let Some(entry) = self.flatpak_queue.borrow_mut().pop_front() else {
+            self.flatpak_running.set(false);
+            self.flatpak_job_revealer.set_reveal_child(false);
+            return;
+        };
+
+        self.flatpak_running.set(true);
+        self.flatpak_job_label.set_text(&entry.label);
+        self.flatpak_job_progress.set_fraction(0.0);
+        self.flatpak_job_progress.set_text(None);
+        self.flatpak_job_revealer.set_reveal_child(true);
+
+        let done_app = self.clone();
+        let label = entry.label;
+        let progress_bar = self.flatpak_job_progress.clone();
+        runtime::spawn_job(
+            entry.job,
+            move |line| {
+                if let Some(progress) = flatpak::parse_progress(&line) {
+                    progress_bar.set_fraction(progress.percent as f64 / 100.0);
+                    progress_bar.set_text(Some(&format!("{}%", progress.percent)));
+                }
+            },
+            move |success| {
+                done_app.send_notification(&label, success);
+                done_app.toast(&if success { format!("{label} — done") } else { format!("{label} — failed") });
+                done_app.start_next_flatpak();
+            },
+        );
     }
 
     fn enqueue(self: &Rc<Self>, entry: QueueEntry) {
