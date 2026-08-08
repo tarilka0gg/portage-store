@@ -407,6 +407,67 @@ fn extract_change_block(lines: &[String], header_marker: &str) -> Vec<(String, V
     result
 }
 
+/// Pulls `(atom, flag, enabled)` triples out of portage's own circular-
+/// dependency solver output — the resolver already works out which USE
+/// flag flip(s) on which package would break the cycle (see
+/// `_emerge/resolver/circular_dependency.py`'s `circular_dependency_handler`
+/// upstream) and prints them as suggestions rather than leaving a human to
+/// puzzle it out; this reads those back out instead of re-deriving them.
+/// One line per suggested change, shaped like:
+///
+/// ```text
+/// It might be possible to break this cycle
+/// by applying any of the following changes:
+/// - kde-frameworks/kross-6.6.0 (Change USE: +qml -designer)
+/// - kde-frameworks/threadweaver-6.6.0 (Change USE: +test)
+/// ```
+///
+/// When portage offers more than one independent way to break the same
+/// cycle (as above — either package's own change would do), only the
+/// *first* is returned: same "just apply what's needed and retry once"
+/// treatment as `parse_required_use_changes`, not a picker between
+/// alternatives.
+pub fn parse_circular_dependency_use_changes(lines: &[String]) -> Vec<(String, String, bool)> {
+    for line in lines {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("- ") else { continue };
+        let Some(paren) = rest.find(" (Change USE: ") else { continue };
+        let cpv = &rest[..paren];
+        let atom = strip_pkg_version(cpv);
+        let Some(flags_start) = rest.find("Change USE: ") else { continue };
+        let flags_text = rest[flags_start + "Change USE: ".len()..].trim_end_matches(')');
+        let changes: Vec<(String, String, bool)> = flags_text
+            .split_whitespace()
+            .filter_map(|tok| match tok.strip_prefix('-') {
+                Some(flag) => Some((atom.clone(), flag.to_string(), false)),
+                None => tok.strip_prefix('+').map(|flag| (atom.clone(), flag.to_string(), true)),
+            })
+            .collect();
+        if !changes.is_empty() {
+            return changes;
+        }
+    }
+    Vec::new()
+}
+
+/// `category/name-version` down to `category/name` — same "walk back from
+/// the end until a component looks like a version" logic
+/// `ui::strip_version_suffix` already uses for display names, duplicated
+/// here in the parsing layer rather than made `pub` there since this is
+/// feeding `package_use::set_flag`, not a label.
+fn strip_pkg_version(cpv: &str) -> String {
+    let Some((category, pf)) = cpv.split_once('/') else {
+        return cpv.to_string();
+    };
+    let parts: Vec<&str> = pf.split('-').collect();
+    for i in (1..parts.len()).rev() {
+        if parts[i].starts_with(|c: char| c.is_ascii_digit()) {
+            return format!("{category}/{}", parts[..i].join("-"));
+        }
+    }
+    cpv.to_string()
+}
+
 /// Boils a failed `--pretend` run down to one plain-language sentence.
 /// Portage's own diagnostics are long and jargon-heavy; these are the three
 /// causes a non-expert actually hits, and each has a different fix.
@@ -890,6 +951,51 @@ mod tests {
     fn no_required_use_changes_block_yields_nothing() {
         let lines = vec!["Some unrelated failure.".to_string(), "!!! Blocked packages".to_string()];
         assert!(parse_required_use_changes(&lines).is_empty());
+    }
+
+    #[test]
+    fn circular_dependency_suggestion_is_parsed_into_atom_flag_pairs() {
+        // Verbatim shape (colors stripped) from portage's own
+        // `circular_dependency_handler` — see
+        // `_emerge/resolver/circular_dependency.py` upstream.
+        let lines = vec![
+            "It might be possible to break this cycle".to_string(),
+            "by applying any of the following changes:".to_string(),
+            "- kde-frameworks/kross-6.6.0 (Change USE: +qml -designer)".to_string(),
+            "- kde-frameworks/threadweaver-6.6.0 (Change USE: +test)".to_string(),
+        ];
+        assert_eq!(
+            parse_circular_dependency_use_changes(&lines),
+            vec![
+                ("kde-frameworks/kross".to_string(), "qml".to_string(), true),
+                ("kde-frameworks/kross".to_string(), "designer".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_suggested_change_is_parsed_the_same_way() {
+        let lines = vec![
+            "It might be possible to break this cycle".to_string(),
+            "by applying the following change:".to_string(),
+            "- dev-libs/foo-1.0 (Change USE: +bar)".to_string(),
+        ];
+        assert_eq!(
+            parse_circular_dependency_use_changes(&lines),
+            vec![("dev-libs/foo".to_string(), "bar".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn no_circular_dependency_suggestion_yields_nothing() {
+        let lines = vec!["Some unrelated failure.".to_string()];
+        assert!(parse_circular_dependency_use_changes(&lines).is_empty());
+    }
+
+    #[test]
+    fn strips_versions_with_hyphens_in_the_package_name() {
+        assert_eq!(strip_pkg_version("kde-frameworks/kross-6.6.0"), "kde-frameworks/kross");
+        assert_eq!(strip_pkg_version("dev-libs/some-lib-r1-2.0-r3"), "dev-libs/some-lib-r1");
     }
 
     #[test]

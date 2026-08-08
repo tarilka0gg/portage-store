@@ -96,27 +96,35 @@ fn is_log_error_line(line: &str) -> bool {
         || trimmed.contains(" FAILED")
 }
 
-/// One of the three "you need to relax something to proceed" blocks
+/// One of the four "you need to relax something to proceed" blocks
 /// portage prints in an identical shape (see `emerge::parse_required_*`),
 /// detected from a failed job's own output and offered as an apply-and-
 /// retry dialog rather than just reported as a bare failure — the exact
-/// same treatment already proven for USE flags, generalized to the two
-/// other cases that hit the identical dead end.
+/// same treatment already proven for USE flags, generalized to the other
+/// cases that hit the identical dead end.
 #[derive(Clone)]
 enum PendingRelaxation {
     Use(Vec<(String, String, bool)>),
     Keyword(Vec<(String, String)>),
     License(Vec<(String, Vec<String>)>),
+    /// A circular dependency, resolved by flipping one of the USE flags
+    /// portage's own resolver already identified as breaking the cycle
+    /// (see `emerge::parse_circular_dependency_use_changes`) — mechanically
+    /// identical to `Use` (same `package_use::set_flag` write), but kept
+    /// as its own variant so the dialog can honestly say *why* this
+    /// change is needed instead of implying it's an ordinary
+    /// REQUIRED_USE mismatch.
+    Circular(Vec<(String, String, bool)>),
 }
 
 impl PendingRelaxation {
     /// Checked in the same order portage itself prints the blocks
-    /// (keyword, then USE, then license — see the real output this is
-    /// parsed from) — not that the order matters for correctness, since
-    /// each parser only ever matches its own block, but this is only
-    /// ever used to prompt for *one* fix at a time even if a run somehow
-    /// needed more than one kind, and starting with keywords first is as
-    /// good a choice as any.
+    /// (keyword, then USE, then license, then circular-dependency — see
+    /// the real output this is parsed from) — not that the order matters
+    /// for correctness, since each parser only ever matches its own
+    /// block, but this is only ever used to prompt for *one* fix at a
+    /// time even if a run somehow needed more than one kind, and
+    /// starting with keywords first is as good a choice as any.
     fn detect(output: &[String]) -> Option<Self> {
         let keyword_changes = emerge::parse_required_keyword_changes(output);
         if !keyword_changes.is_empty() {
@@ -130,6 +138,10 @@ impl PendingRelaxation {
         if !license_changes.is_empty() {
             return Some(Self::License(license_changes));
         }
+        let circular_changes = emerge::parse_circular_dependency_use_changes(output);
+        if !circular_changes.is_empty() {
+            return Some(Self::Circular(circular_changes));
+        }
         None
     }
 
@@ -138,6 +150,7 @@ impl PendingRelaxation {
             Self::Use(_) => "USE flag changes needed",
             Self::Keyword(_) => "Keyword changes needed",
             Self::License(_) => "License acceptance needed",
+            Self::Circular(_) => "Circular dependency found",
         }
     }
 
@@ -148,6 +161,7 @@ impl PendingRelaxation {
             Self::Use(_) => "the required USE changes",
             Self::Keyword(_) => "the required keyword changes",
             Self::License(_) => "the required license changes",
+            Self::Circular(_) => "a USE change to break the cycle",
         }
     }
 
@@ -158,12 +172,16 @@ impl PendingRelaxation {
             Self::Use(_) => "needs these USE flag changes on a dependency before it can proceed:",
             Self::Keyword(_) => "needs these keyword changes before it can proceed:",
             Self::License(_) => "needs these licenses accepted before it can proceed:",
+            Self::Circular(_) => {
+                "hit a circular dependency — two or more packages need each other before either can \
+                 build. Portage's own resolver found a USE flag change that breaks the cycle:"
+            }
         }
     }
 
     fn body_lines(&self) -> Vec<String> {
         match self {
-            Self::Use(changes) => changes
+            Self::Use(changes) | Self::Circular(changes) => changes
                 .iter()
                 .map(|(atom, flag, enabled)| format!("{atom}  {}{flag}", if *enabled { "" } else { "-" }))
                 .collect(),
@@ -180,7 +198,7 @@ impl PendingRelaxation {
     /// goes through `pkexec`.
     fn apply(&self) -> anyhow::Result<()> {
         match self {
-            Self::Use(changes) => {
+            Self::Use(changes) | Self::Circular(changes) => {
                 for (atom, flag, enabled) in changes {
                     package_use::set_flag(atom, flag, *enabled)?;
                 }
