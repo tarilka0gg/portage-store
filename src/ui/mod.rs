@@ -65,6 +65,37 @@ struct FlatpakQueueEntry {
     label: String,
 }
 
+/// One line in the log sheet: which lane printed it (shown as a prefix
+/// when both are running) and whether `is_log_error_line` flagged it —
+/// the "errors only" filter just hides everything that isn't.
+struct LogLine {
+    source: &'static str,
+    text: String,
+    is_error: bool,
+}
+
+/// Whether a line of `emerge`/`flatpak` output reads as an actual error
+/// rather than routine noise. Deliberately narrow: portage's own build
+/// log is mostly informational " * " lines and the occasional genuine
+/// "eselect news read" reminder, neither of which is what "show only
+/// errors" is asking to still see. Matches the conventions both tools
+/// actually use for a real problem — portage's `!!!`/`* ERROR:` prefixes,
+/// flatpak's own "error:" — rather than a bare substring match on
+/// "error" (which would also catch lines like `USE=... "error-reporting"`
+/// or a package literally named with "error" in it).
+fn is_log_error_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("!!!")
+        || trimmed.starts_with("* ERROR")
+        // Catches both a bare `error: ...` line and the common
+        // `<tool>: error: ...` shape autotools/gcc/clang build failures
+        // use (e.g. `configure: error: ...`) — a colon after "error" is
+        // what actually marks it as the message-severity keyword rather
+        // than, say, a USE flag literally named `error-reporting`.
+        || trimmed.contains("error:")
+        || trimmed.contains(" FAILED")
+}
+
 /// One of the three "you need to relax something to proceed" blocks
 /// portage prints in an identical shape (see `emerge::parse_required_*`),
 /// detected from a failed job's own output and offered as an apply-and-
@@ -232,6 +263,24 @@ pub struct App {
     flatpak_job_label: gtk::Label,
     flatpak_job_progress: gtk::ProgressBar,
 
+    /// The full-output log sheet — opened by clicking either job bar's
+    /// status text, slides up from the bottom (a `gtk::Revealer` stacked
+    /// as one more `AdwToolbarView` bottom bar, the same mechanism
+    /// `job_revealer`/`flatpak_job_revealer` already use, just for a
+    /// taller panel). Every line either job has printed lands here —
+    /// `job_log` only ever shows the latest one — with a toggle to hide
+    /// anything that isn't flagged as an error.
+    log_drawer_revealer: gtk::Revealer,
+    log_drawer_buffer: gtk::TextBuffer,
+    log_drawer_scroller: gtk::ScrolledWindow,
+    log_errors_only: gtk::ToggleButton,
+    /// Every line either job type has printed this run, tagged with
+    /// which job produced it (for when both lanes are active at once)
+    /// and whether it looks like an error — kept independently of
+    /// `log_drawer_buffer` so toggling the filter can re-render from
+    /// scratch without re-parsing anything.
+    log_lines: RefCell<Vec<LogLine>>,
+
     installed_grid: gtk::FlowBox,
     installed_stack: gtk::Stack,
     installed_scroller: gtk::ScrolledWindow,
@@ -275,6 +324,15 @@ pub struct App {
     /// delay elapses, without touching `search_generation`'s own bookkeeping
     /// for in-flight background lookups.
     search_debounce: Cell<u64>,
+    /// As `search_generation`, but for `check_updates` — an update job's
+    /// own post-success refresh, the header refresh button, and startup
+    /// can all trigger a `check_updates` call independently of each
+    /// other, and a `--pretend` run against `@world` isn't instant. Without
+    /// this, an earlier-started but slower-finishing check could land
+    /// *after* a later, more relevant one and silently overwrite its
+    /// accurate result with stale data — exactly "I just updated this and
+    /// it still shows as pending".
+    updates_generation: Cell<u64>,
     settings: RefCell<settings::Settings>,
     /// Container the landing page's curated-theme sections get appended
     /// into once resolved — one section per `CuratedBlock`, each its own
@@ -921,13 +979,23 @@ impl App {
         queue_button.set_valign(gtk::Align::Center);
         queue_button.set_tooltip_text(Some("View queued jobs"));
 
+        // Wrapped in a flat, chrome-free button rather than a bare click
+        // gesture on the box — same visible layout, but gets hover/press
+        // feedback and keyboard/accessibility activation for free.
+        // Opens the log sheet (`log_drawer_revealer`), wired once `app`
+        // exists (see below `App::build`).
+        let job_text_button = gtk::Button::builder().child(&job_text).build();
+        job_text_button.add_css_class("flat");
+        job_text_button.set_hexpand(true);
+        job_text_button.set_tooltip_text(Some("View full log"));
+
         let job_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         job_box.set_margin_top(10);
         job_box.set_margin_bottom(10);
         job_box.set_margin_start(14);
         job_box.set_margin_end(14);
         job_box.append(&job_spinner);
-        job_box.append(&job_text);
+        job_box.append(&job_text_button);
         job_box.append(&queue_button);
 
         let job_revealer = gtk::Revealer::builder().child(&job_box).build();
@@ -953,15 +1021,78 @@ impl App {
         flatpak_job_text.append(&flatpak_job_label);
         flatpak_job_text.append(&flatpak_job_progress);
 
+        let flatpak_job_text_button = gtk::Button::builder().child(&flatpak_job_text).build();
+        flatpak_job_text_button.add_css_class("flat");
+        flatpak_job_text_button.set_hexpand(true);
+        flatpak_job_text_button.set_tooltip_text(Some("View full log"));
+
         let flatpak_job_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         flatpak_job_box.set_margin_top(6);
         flatpak_job_box.set_margin_bottom(6);
         flatpak_job_box.set_margin_start(14);
         flatpak_job_box.set_margin_end(14);
         flatpak_job_box.append(&flatpak_job_spinner);
-        flatpak_job_box.append(&flatpak_job_text);
+        flatpak_job_box.append(&flatpak_job_text_button);
 
         let flatpak_job_revealer = gtk::Revealer::builder().child(&flatpak_job_box).build();
+
+        // --- log sheet ---------------------------------------------------
+        // The full-output view behind either job bar's "latest line"
+        // label — every line collected in `log_lines`, rendered here on
+        // demand rather than kept permanently on screen the way the
+        // one-line summary is. A `gtk::TextView` over a `gtk::TextBuffer`
+        // rather than one row per line: a real build can print thousands
+        // of lines, and a `ListBox` of that many rows would be far
+        // heavier than one text buffer holding the same content.
+        let log_drawer_buffer = gtk::TextBuffer::new(None);
+        let log_drawer_view = gtk::TextView::with_buffer(&log_drawer_buffer);
+        log_drawer_view.set_editable(false);
+        log_drawer_view.set_cursor_visible(false);
+        log_drawer_view.set_monospace(true);
+        log_drawer_view.set_left_margin(8);
+        log_drawer_view.set_top_margin(6);
+        log_drawer_view.set_bottom_margin(6);
+        log_drawer_view.add_css_class("caption");
+
+        let log_drawer_scroller =
+            gtk::ScrolledWindow::builder().vexpand(true).height_request(220).child(&log_drawer_view).build();
+
+        let log_errors_only = gtk::ToggleButton::with_label("Errors Only");
+        log_errors_only.add_css_class("flat");
+        log_errors_only.set_tooltip_text(Some("Hide everything except lines that look like an actual error"));
+
+        let log_close_button = gtk::Button::from_icon_name("go-down-symbolic");
+        log_close_button.add_css_class("flat");
+        log_close_button.set_tooltip_text(Some("Close"));
+
+        let log_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        log_header.set_margin_start(12);
+        log_header.set_margin_end(8);
+        log_header.set_margin_top(6);
+        let log_header_title = gtk::Label::new(Some("Log"));
+        log_header_title.add_css_class("heading");
+        log_header_title.set_hexpand(true);
+        log_header_title.set_xalign(0.0);
+        log_header.append(&log_header_title);
+        log_header.append(&log_errors_only);
+        log_header.append(&log_close_button);
+
+        let log_column = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        log_column.append(&log_header);
+        log_column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        log_column.append(&log_drawer_scroller);
+        log_column.add_css_class("background");
+
+        // Slides up over the job bars beneath it rather than replacing
+        // them — closing it (via `log_close_button` or reopening the same
+        // job's own status line) leaves whatever job is still running
+        // visible exactly as before.
+        let log_drawer_revealer =
+            gtk::Revealer::builder().transition_type(gtk::RevealerTransitionType::SlideUp).child(&log_column).build();
+        {
+            let log_drawer_revealer_for_close = log_drawer_revealer.clone();
+            log_close_button.connect_clicked(move |_| log_drawer_revealer_for_close.set_reveal_child(false));
+        }
 
         // Gentoo news is a GLEP-42 announcement channel for changes that
         // can break a system if missed (a profile migration, a dropped
@@ -997,6 +1128,7 @@ impl App {
         toolbar.add_top_bar(&config_protect_banner);
         toolbar.add_top_bar(&sync_banner);
         toolbar.set_content(Some(&view_stack));
+        toolbar.add_bottom_bar(&log_drawer_revealer);
         toolbar.add_bottom_bar(&job_revealer);
         toolbar.add_bottom_bar(&flatpak_job_revealer);
 
@@ -1109,6 +1241,11 @@ impl App {
             flatpak_job_revealer,
             flatpak_job_label,
             flatpak_job_progress,
+            log_drawer_revealer,
+            log_drawer_buffer,
+            log_drawer_scroller,
+            log_errors_only,
+            log_lines: RefCell::new(Vec::new()),
             installed_grid,
             installed_stack,
             installed_scroller,
@@ -1137,6 +1274,7 @@ impl App {
             running: Cell::new(false),
             search_generation: Cell::new(0),
             search_debounce: Cell::new(0),
+            updates_generation: Cell::new(0),
             settings: RefCell::new(settings::load()),
             featured_section: featured_section.clone(),
         });
@@ -1177,6 +1315,18 @@ impl App {
         {
             let app_for_click = app.clone();
             queue_button.connect_clicked(move |button| app_for_click.present_queue_popover(button));
+        }
+        {
+            let app_for_click = app.clone();
+            job_text_button.connect_clicked(move |_| app_for_click.toggle_log_drawer());
+        }
+        {
+            let app_for_click = app.clone();
+            flatpak_job_text_button.connect_clicked(move |_| app_for_click.toggle_log_drawer());
+        }
+        {
+            let app_for_toggle = app.clone();
+            app.log_errors_only.connect_toggled(move |_| app_for_toggle.render_log_drawer());
         }
         {
             let popover = app.build_filter_popover();
@@ -1678,6 +1828,8 @@ impl App {
 
     fn check_updates(self: &Rc<Self>) {
         self.updates_stack.set_visible_child_name("checking");
+        self.updates_generation.set(self.updates_generation.get() + 1);
+        let generation = self.updates_generation.get();
         let lines: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let collect = lines.clone();
         let app = self.clone();
@@ -1685,6 +1837,13 @@ impl App {
             emerge::pretend_world_job(self.settings.borrow().prefer_binary_packages),
             move |line| collect.borrow_mut().push(line),
             move |_success| {
+                // An overtaken check (a newer one started after this one)
+                // finishing late must not clobber the newer, more
+                // accurate result with what could easily be stale
+                // pre-update data.
+                if generation != app.updates_generation.get() {
+                    return;
+                }
                 let atoms = parse_update_atoms(&lines.borrow());
                 let download_kib = emerge::parse_pretend_output(&lines.borrow()).download_kib;
                 app.show_updates(atoms, download_kib);
@@ -2526,10 +2685,12 @@ impl App {
         self.flatpak_job_progress.set_fraction(0.0);
         self.flatpak_job_progress.set_text(None);
         self.flatpak_job_revealer.set_reveal_child(true);
+        self.clear_job_log("flatpak");
 
         let done_app = self.clone();
         let label = entry.label;
         let progress_bar = self.flatpak_job_progress.clone();
+        let log_app = self.clone();
         runtime::spawn_job(
             entry.job,
             move |line| {
@@ -2537,6 +2698,7 @@ impl App {
                     progress_bar.set_fraction(progress.percent as f64 / 100.0);
                     progress_bar.set_text(Some(&format!("{}%", progress.percent)));
                 }
+                log_app.append_job_log("flatpak", &line);
             },
             move |success| {
                 done_app.send_notification(&label, success);
@@ -2603,6 +2765,7 @@ impl App {
         self.running.set(true);
         self.job_label.set_text(&entry.label);
         self.job_log.set_text("");
+        self.clear_job_log("portage");
         self.job_eta.set_visible(false);
         if !entry.known_atoms.is_empty() {
             let job_eta = self.job_eta.clone();
@@ -2727,6 +2890,7 @@ impl App {
                     log_app.job_progress.set_text(Some(&text));
                 }
                 log_app.job_log.set_text(&line);
+                log_app.append_job_log("portage", &line);
                 output_for_line.borrow_mut().push(line);
             },
             move |success| {
@@ -2859,6 +3023,65 @@ impl App {
         self.toasts.add_toast(adw::Toast::new(message));
     }
 
+    /// Clears this lane's own lines from the log sheet for a fresh job —
+    /// called at the start of `start_next`/`start_next_flatpak` rather
+    /// than only when the drawer happens to be open, so `log_lines` never
+    /// carries a previous job's output into a new one even if the sheet
+    /// was never opened for it. Scoped to `source` rather than wiping the
+    /// whole buffer: Portage and Flatpak jobs can run at the same time
+    /// (see `flatpak_queue`'s own doc comment), and a new job starting in
+    /// one lane shouldn't erase the other lane's still-relevant,
+    /// still-running output.
+    fn clear_job_log(&self, source: &'static str) {
+        self.log_lines.borrow_mut().retain(|l| l.source != source);
+        self.render_log_drawer();
+    }
+
+    /// Appends one line to the log sheet, tagged with which lane produced
+    /// it. Re-renders immediately if the sheet is currently open (a
+    /// closed sheet just accumulates — no reason to touch the
+    /// `TextBuffer` for content nobody's looking at yet).
+    fn append_job_log(&self, source: &'static str, text: &str) {
+        let is_error = is_log_error_line(text);
+        self.log_lines.borrow_mut().push(LogLine { source, text: text.to_string(), is_error });
+        if self.log_drawer_revealer.reveals_child() {
+            self.render_log_drawer();
+        }
+    }
+
+    /// Rebuilds the log sheet's `TextBuffer` from `log_lines`, applying
+    /// the "Errors Only" filter and scrolling to the bottom — the whole
+    /// buffer is replaced rather than incrementally appended to, since
+    /// toggling the filter needs a full re-render anyway and a rebuild is
+    /// cheap even for a few thousand lines.
+    fn render_log_drawer(&self) {
+        let lines = self.log_lines.borrow();
+        let errors_only = self.log_errors_only.is_active();
+        // Both lanes can be running at once (see `flatpak_queue`'s own
+        // doc comment) — the source prefix only earns its keep when
+        // there's more than one lane's output actually present, so a
+        // single-lane run reads as a plain, unprefixed log like before.
+        let multiple_sources = lines.iter().map(|l| l.source).collect::<std::collections::HashSet<_>>().len() > 1;
+        let text: String = lines
+            .iter()
+            .filter(|l| !errors_only || l.is_error)
+            .map(|l| if multiple_sources { format!("[{}] {}", l.source, l.text) } else { l.text.clone() })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.log_drawer_buffer.set_text(&text);
+        let end = self.log_drawer_buffer.end_iter();
+        self.log_drawer_buffer.place_cursor(&end);
+        self.log_drawer_scroller.vadjustment().set_value(self.log_drawer_scroller.vadjustment().upper());
+    }
+
+    fn toggle_log_drawer(&self) {
+        let opening = !self.log_drawer_revealer.reveals_child();
+        self.log_drawer_revealer.set_reveal_child(opening);
+        if opening {
+            self.render_log_drawer();
+        }
+    }
+
     /// A real desktop notification, not just a toast — a multi-hour
     /// `@world` update is exactly the kind of job someone starts and
     /// then leaves the computer for, and a toast that's already faded by
@@ -2881,5 +3104,30 @@ impl App {
         // notification is still showing replaces it instead of stacking
         // up duplicates for jobs that have already been superseded.
         application.send_notification(Some("job-complete"), &notification);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portage_error_markers_are_recognized() {
+        assert!(is_log_error_line("!!! Multiple package instances within a single package slot"));
+        assert!(is_log_error_line(" * ERROR: dev-libs/boost-1.86.0::gentoo failed (compile phase)"));
+        assert!(is_log_error_line("configure: error: C compiler cannot create executables"));
+    }
+
+    #[test]
+    fn flatpak_error_markers_are_recognized() {
+        assert!(is_log_error_line("error: No remote refs found for 'flathub'"));
+    }
+
+    #[test]
+    fn routine_output_is_not_flagged_as_an_error() {
+        assert!(!is_log_error_line(" * Messages for package dev-libs/boost-1.86.0:"));
+        assert!(!is_log_error_line(">>> Jobs: 3 of 17, 1 complete"));
+        assert!(!is_log_error_line("Installing… ████████            13%"));
+        assert!(!is_log_error_line("USE=\"error-reporting\" dev-lang/rust"));
     }
 }
