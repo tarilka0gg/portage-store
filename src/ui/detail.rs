@@ -1254,43 +1254,20 @@ pub fn build(
     progress_bar.set_visible(false);
     progress_bar.set_width_request(120);
 
-    // Hidden until a failed `--pretend` run (below) reveals it — this is
-    // the escape hatch for exactly that situation, so there's nothing for
-    // it to do before then. Its own dialog logic lives in
-    // `confirm_sandbox_build` below, shared with the "⋮" menu's own copy
-    // of this same option, so the two entry points can't drift apart.
-    let sandbox_button = gtk::Button::with_label("Build in Isolated Sandbox");
-    sandbox_button.add_css_class("pill");
-    sandbox_button.set_visible(false);
-    sandbox_button.set_tooltip_text(Some(&format!(
-        "Builds this package in a separate, disposable Gentoo root that ignores masks and \
-         keyword restrictions — nothing about your real system's configuration changes. \
-         A small pool of up to {} reused build instances shares one base system, so a \
-         package only gets its own fresh instance if it actually conflicts with something \
-         already built in an earlier one. First use downloads that base system (several \
-         hundred MB) and can take a while.",
-        crate::portage::sandbox::MAX_SANDBOX_INSTANCES
-    )));
-    sandbox_button.connect_clicked({
-        let atom = atom.clone();
-        let display_name = display_name.clone();
-        let on_sandbox_build = on_sandbox_build.clone();
-        move |button| confirm_sandbox_build(button, &atom, &display_name, &on_sandbox_build)
-    });
-
     // --- overflow menu: alternate install routes ---------------------
     //
-    // Two ways around the normal Portage install, offered from the same
-    // "⋮" menu next to Install rather than as more always-visible
-    // buttons crowding the hero: building in the isolated sandbox (for
+    // Two ways around the normal Portage install, offered from a single
+    // "⋮" menu next to Install: building in the isolated sandbox (for
     // when Portage's own resolver won't get past a mask or conflict) and
     // installing via Flatpak instead (for when compiling from source is
     // slower than just grabbing a prebuilt Flatpak of the same app).
-    // Both rows exist unconditionally; only the Flatpak one starts
-    // hidden, since whether it applies depends on two async answers
-    // (a confident Flatpak match existing, and Portage having no binary
-    // for this package) that haven't come back yet when the menu is
-    // built.
+    // Deliberately *not* also a separate always-or-sometimes-visible
+    // pill button next to it for the sandbox option — an earlier version
+    // had both, and on an actual resolver failure they ended up
+    // rendering stacked on top of each other in the same corner: the
+    // menu's own row, popped open, directly overlapping the other
+    // button's spot. One control, reachable proactively or as a
+    // recommendation, is simpler and doesn't collide with itself.
     let overflow_menu_button = gtk::MenuButton::new();
     overflow_menu_button.set_icon_name("view-more-symbolic");
     overflow_menu_button.set_tooltip_text(Some("More install options"));
@@ -1299,6 +1276,15 @@ pub fn build(
 
     let sandbox_menu_row = gtk::Button::builder().child(&menu_row_content("system-run-symbolic", "Build in Isolated Sandbox")).build();
     sandbox_menu_row.add_css_class("flat");
+    sandbox_menu_row.set_tooltip_text(Some(&format!(
+        "Builds this package in a separate, disposable Gentoo root that ignores masks and \
+         keyword restrictions — nothing about your real system's configuration changes. \
+         A small pool of up to {} reused build instances shares one base system, so a \
+         package only gets its own fresh instance if it actually conflicts with something \
+         already built in an earlier one. First use downloads that base system (several \
+         hundred MB) and can take a while.",
+        crate::portage::sandbox::MAX_SANDBOX_INSTANCES
+    )));
     sandbox_menu_row.connect_clicked({
         let atom = atom.clone();
         let display_name = display_name.clone();
@@ -1380,7 +1366,6 @@ pub fn build(
     action_column.set_halign(gtk::Align::End);
     action_column.append(&action_row);
     action_column.append(&progress_bar);
-    action_column.append(&sandbox_button);
 
     let hero_text = gtk::Box::new(gtk::Orientation::Vertical, 6);
     hero_text.set_hexpand(true);
@@ -2032,7 +2017,7 @@ pub fn build(
     let atom_for_pretend_cache = atom.clone();
     let version_for_pretend_cache = pkg.latest_version.clone();
     let lines_for_apply = lines.clone();
-    let sandbox_button_write = sandbox_button.clone();
+    let overflow_menu_button_write = overflow_menu_button.clone();
     let disk_space_banner_write = disk_space_banner.clone();
     let blocker_banner_write = blocker_banner.clone();
     let needs_source_build_write = needs_source_build.clone();
@@ -2093,10 +2078,18 @@ pub fn build(
             None => disk_space_banner_write.set_revealed(false),
         }
 
-        // Offered only on an actual resolver failure — a package that
-        // resolves fine on the live system has no reason to route around
-        // it via the sandbox.
-        sandbox_button_write.set_visible(!success);
+        // A resolver failure is exactly when the sandbox option (already
+        // in the menu regardless) is actually worth reaching for — flagged
+        // on the menu button itself rather than a second, separately
+        // placed control, so there's one place to look instead of two
+        // that can end up visually colliding.
+        if !success {
+            overflow_menu_button_write.add_css_class("suggested-action");
+            overflow_menu_button_write.set_tooltip_text(Some(
+                "More install options — this package didn't resolve directly; \
+                 Build in Isolated Sandbox is the way around that.",
+            ));
+        }
 
         let blockers = emerge::parse_blockers(&lines);
         if let Some(first) = blockers.first() {
