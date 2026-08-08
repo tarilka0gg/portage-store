@@ -1,0 +1,245 @@
+/* Only the category tiles get hard-coded colour; everything else inherits
+   the user's GTK/libadwaita theme so the app matches the rest of the
+   desktop instead of fighting it. */
+
+.category-tile {
+  min-height: 88px;
+  padding: 0 18px;
+  border-radius: 16px;
+  border: none;
+  color: #ffffff;
+  font-size: 1.15rem;
+  font-weight: 800;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  box-shadow: none;
+}
+
+.category-tile:hover {
+  filter: brightness(1.08);
+}
+
+/* The detail page's Install/Remove button while its own job is running
+   (see `App::start_next` in mod.rs) — a light band sweeping left to right
+   over the button's own colour, the same "still working" read as the
+   progress bar's indeterminate pulse underneath it, just on the button
+   itself since it's disabled (and so otherwise looks inert) for the same
+   stretch of time. */
+@keyframes button-pulse-sweep {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+
+.detail-action-pulsing {
+  background-image: linear-gradient(
+    100deg,
+    transparent 40%,
+    alpha(#ffffff, 0.35) 50%,
+    transparent 60%
+  );
+  background-size: 250% 100%;
+  animation: button-pulse-sweep 1.4s linear infinite;
+}
+
+.category-tile:active {
+  filter: brightness(0.94);
+}
+
+.category-tile image {
+  -gtk-icon-size: 26px;
+}
+
+/* Творчість */
+.category-tile-0 { background-image: linear-gradient(160deg, #a06ee1, #4568dc); }
+/* Робота — the one pale tile, so it needs dark text and no glow. */
+.category-tile-1 {
+  background-image: linear-gradient(160deg, #fbf6d9, #f3ebc3);
+  color: #2b5ea8;
+  text-shadow: none;
+}
+/* Ігри */
+.category-tile-2 { background-image: linear-gradient(120deg, #ffd3a5, #f78ca0 55%, #7b4dff); }
+/* Спілкування */
+.category-tile-3 { background-image: linear-gradient(120deg, #f0416c, #ff7158); }
+/* Навчання */
+.category-tile-4 { background-image: linear-gradient(160deg, #2fbf71, #17a35c); }
+/* Розробка */
+.category-tile-5 { background-image: linear-gradient(160deg, #6b6b76, #4a4a55); }
+
+/* Package cards in the browse grids. */
+.package-card {
+  padding: 14px;
+  border-radius: 12px;
+}
+
+.package-card-title {
+  font-weight: 700;
+}
+
+/* Reserves height for a full 2 lines even when the actual description
+   only fills one, so every card — and every featured-carousel page — ends
+   up the same height regardless of how long its description happens to
+   be. */
+.package-card-subtitle {
+  min-height: 2.6em;
+}
+
+/* The detail page's hero: a larger, bolder title than the rest of the
+   page's headings. */
+.hero-title {
+  font-size: 1.8rem;
+  font-weight: 800;
+}
+
+/* Padding/radius for the panel behind the screenshot carousel (matching
+   GNOME Software's tinted backdrop behind the screenshot row) — its
+   background color comes from the "card" class layered on alongside this
+   one, the same built-in style the "Download Size"/"Build Time" facts row
+   uses, so the two panels are guaranteed the same color. */
+.screenshot-carousel-panel {
+  padding: 16px 0 4px 0;
+  border-radius: 0;
+}
+
+/* The long-description text reads as a wall of text at the default
+   line-height; loosen it so paragraphs are easier to scan. */
+.description-heading {
+  line-height: 1.4;
+}
+
+.description-body {
+  line-height: 1.5;
+}
+
+/* Rounded square behind the fallback symbolic icon, so packages without
+   real artwork still line up visually with the ones that have it. */
+.icon-fallback {
+  border-radius: 12px;
+  background-color: alpha(currentColor, 0.10);
+  opacity: 0.55;
+}
+
+/* The four at-a-glance facts on the detail page. Each is a button — click
+   to expand a breakdown below the row — so this restyles button chrome
+   back down to plain tile padding instead of the default flat-button look. */
+.info-tile {
+  padding: 16px 10px;
+  border-radius: 12px;
+}
+
+.info-tile-icon {
+  border-radius: 999px;
+  min-width: 44px;
+  min-height: 44px;
+  background-color: alpha(currentColor, 0.10);
+}
+
+/* The "there's more" affordance: invisible until hovered, so the tiles
+   read as plain facts at rest and only hint at being expandable on
+   approach — the same "quiet until relevant" idea as the tile's hover
+   background itself. */
+.info-tile-hint {
+  opacity: 0;
+  transition: opacity 150ms ease;
+  font-weight: 800;
+  color: alpha(currentColor, 0.5);
+}
+
+.info-tile:hover .info-tile-hint {
+  opacity: 1;
+}
+
+/* The expand panel that drops down under the fact tiles. */
+.tile-expand-panel {
+  padding: 12px 4px 4px 4px;
+}
+
+.section-heading {
+  font-size: 1.05rem;
+  font-weight: 800;
+}
+
+.job-log {
+  font-family: monospace;
+  font-size: 0.85rem;
+}
+
+.screenshot {
+  border-radius: 12px;
+}
+
+/* Config-update diff hunks (config_update.rs). `@error_bg_color`/
+   `@success_bg_color` are libadwaita's own semantic tokens — they already
+   adapt between light and dark themes, so a removed/added line reads
+   correctly in both without a separate dark-mode rule here. */
+.diff-removed-line {
+  background-color: alpha(@error_bg_color, 0.35);
+  color: @error_color;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.diff-added-line {
+  background-color: alpha(@success_bg_color, 0.35);
+  color: @success_color;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+/* The screenshot lightbox's own dimmed backdrop — a plain scrim filling
+   the window, not an AdwDialog card, so the carousel floats directly on
+   it instead of sitting inside a second, visually distinct window. Fades
+   in on open and out on close via `.-hidden`, since a hand-rolled scrim
+   doesn't get that transition for free the way AdwDialog did. */
+.screenshot-lightbox-scrim {
+  background-color: alpha(black, 0.55);
+  opacity: 1;
+  transition: opacity 200ms ease;
+}
+
+.screenshot-lightbox-scrim-hidden {
+  opacity: 0;
+}
+
+/* The carousel+arrows themselves scale up from the center as the
+   lightbox opens (and back down as it closes), on top of the scrim's own
+   fade above — a zoom-in, not just a fade. Default `transform-origin` is
+   already the widget's center, which is what "from the center" needs. */
+.screenshot-lightbox-content {
+  opacity: 1;
+  transform: scale(1);
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+
+.screenshot-lightbox-content-hidden {
+  opacity: 0;
+  transform: scale(0.85);
+}
+
+/* Hand-rolled dot row for the featured carousels — not
+   AdwCarouselIndicatorDots, since that binds directly to the carousel's
+   own page count, and the wrap-loop clone pages glued to either end of
+   each carousel would otherwise show up as two extra, wrong dots. */
+.carousel-dot {
+  min-width: 6px;
+  min-height: 6px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.25);
+  /* Without this, `set_active_dot` toggling the class below just snaps
+     between states instantly — the page slide is animated but the dot
+     that's supposed to track it wasn't. `transform` rather than
+     `min-width` for the grow effect: animating `min-width` changes the
+     box's actual allocation frame by frame, which the row's layout
+     doesn't reflow in step with, so the dot visibly smeared/doubled
+     instead of just growing in place. `transform` only repaints, leaving
+     layout untouched. */
+  transition: background-color 200ms ease, transform 200ms ease;
+}
+
+.carousel-dot-active {
+  background-color: currentColor;
+  transform: scale(1.2);
+}

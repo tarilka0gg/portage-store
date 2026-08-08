@@ -1,0 +1,25 @@
+[package]
+name = "portage-store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+adw = { version = "0.9.2", package = "libadwaita", features = ["v1_5"] }
+anyhow = "1.0.104"
+async-channel = "2.5.0"
+gtk = { version = "0.11.4", package = "gtk4", features = ["v4_12"] }
+quick-xml = { version = "0.41.0", features = ["serialize"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+similar = "3.1.2"
+tokio = { version = "1.53.1", features = ["full"] }
+webkit6 = { version = "0.6.1", optional = true }
+
+[features]
+# Off by default: WebKitGTK (net-libs/webkit-gtk) is one of the slowest
+# packages to build on Gentoo and isn't a dependency every install of this
+# app should be forced into just for in-app link previews. Enable with
+# `cargo build --features webview` once webkitgtk-6.0 is installed — the
+# in-app "Learn More" web view falls back to opening links in the system
+# browser (as it always has) when this feature is off.
+webview = ["dep:webkit6"]

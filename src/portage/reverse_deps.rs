@@ -1,0 +1,150 @@
+use super::world;
+use std::cell::Cell;
+use std::collections::HashSet;
+use std::process::Command;
+
+/// How many levels up the "who depends on this" chain to follow before
+/// stopping. Four is enough to reach an `@world`-selected package (the
+/// actual "why") in the overwhelming majority of real dependency chains.
+const MAX_DEPTH: u32 = 4;
+
+/// How many direct dependents to keep *per node* — a secondary, local
+/// bound on top of `MAX_EQUERY_CALLS` below. The count still reflects the
+/// true total even when truncated.
+const MAX_CHILDREN: usize = 8;
+
+/// The real safety bound: a hard ceiling on total `equery` subprocess
+/// calls across the *entire* search, not just per level or per node.
+/// `MAX_DEPTH` × `MAX_CHILDREN` alone still allows a worst case of
+/// `8^4` = 4096 calls if every node happened to fan out to the cap at
+/// every level — a low-level library like `glib` genuinely has enough
+/// direct dependents to hit that in practice. This counter is checked
+/// before every call and stops expanding (treating whatever's left as
+/// leaves) once it's spent, so the search's wall-clock time stays
+/// bounded by a fixed call count no matter how connected the dependency
+/// graph turns out to be — exactly the kind of "this could quietly run
+/// for a very long time" risk that's worth guarding against explicitly
+/// rather than trusting depth/width limits alone to keep it in check.
+const MAX_EQUERY_CALLS: u32 = 60;
+
+/// One node in a "why is this installed" tree: the package, whether it's
+/// explicitly in `@world` (the actual reason something's installed, as
+/// opposed to merely a transitive dependency), and whatever else depends
+/// on *it* — recursion stops at a `@world` node, since that's already a
+/// satisfying answer, not just another link to follow further.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepNode {
+    pub atom: String,
+    pub in_world: bool,
+    pub children: Vec<DepNode>,
+    /// How many direct dependents were found in total, before capping to
+    /// `MAX_CHILDREN` — lets the UI say "+12 more" honestly instead of
+    /// silently dropping them.
+    pub total_children: usize,
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `cat/name-1.2.3` -> `cat/name` — `equery depends` reports (and
+/// expects) an exact atom-with-version, but `@world` entries and repeat
+/// lookups both work on the bare atom.
+fn strip_version(atom_with_version: &str) -> String {
+    let Some((category, pf)) = atom_with_version.split_once('/') else {
+        return atom_with_version.to_string();
+    };
+    let parts: Vec<&str> = pf.split('-').collect();
+    for i in (1..parts.len()).rev() {
+        if parts[i].starts_with(|c: char| c.is_ascii_digit()) {
+            return format!("{category}/{}", parts[..i].join("-"));
+        }
+    }
+    atom_with_version.to_string()
+}
+
+/// Every currently-installed package that directly depends on
+/// `bare_atom` — installed-only (no `-a`/`--all-packages`), which is both
+/// faster and the right scope here: an ebuild in the tree that *could*
+/// depend on this but isn't even installed can't be the reason something
+/// else on this exact system is.
+fn direct_dependents(bare_atom: &str) -> Vec<String> {
+    let output = Command::new("equery").args(["--no-color", "depends", bare_atom]).output();
+    let Ok(output) = output else { return Vec::new() };
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().map(|l| strip_ansi(l.trim())).filter(|l| !l.is_empty()).collect()
+}
+
+fn build_tree(
+    atom_with_version: &str,
+    world_atoms: &HashSet<String>,
+    depth_remaining: u32,
+    visited: &mut HashSet<String>,
+    calls_remaining: &Cell<u32>,
+) -> DepNode {
+    let bare = strip_version(atom_with_version);
+    let in_world = world_atoms.contains(&bare);
+
+    let mut children = Vec::new();
+    let mut total_children = 0;
+    // Stops at a `@world` node (that's the answer, not a link to follow
+    // further), at the depth cap, the global call budget, or the first
+    // time this exact atom is seen again (a shared dependency reached via
+    // two different paths — without this, a diamond in the dependency
+    // graph would make the search revisit the same subtree repeatedly).
+    if !in_world && depth_remaining > 0 && calls_remaining.get() > 0 && visited.insert(atom_with_version.to_string()) {
+        calls_remaining.set(calls_remaining.get() - 1);
+        let dependents = direct_dependents(&bare);
+        total_children = dependents.len();
+        for parent in dependents.into_iter().take(MAX_CHILDREN) {
+            if calls_remaining.get() == 0 {
+                break;
+            }
+            children.push(build_tree(&parent, world_atoms, depth_remaining - 1, visited, calls_remaining));
+        }
+    }
+
+    DepNode { atom: atom_with_version.to_string(), in_world, children, total_children }
+}
+
+/// Builds the "why is this installed" tree rooted at `atom_with_version`
+/// (e.g. `dev-libs/glib-2.84.0`, the exact form `equery depends` itself
+/// reports and `installed::InstalledPackage` can supply). Blocking — runs
+/// several `equery` subprocesses (bounded by `MAX_EQUERY_CALLS` no matter
+/// how connected the dependency graph is); call off the main thread.
+pub fn why_installed(atom_with_version: &str) -> DepNode {
+    let world_atoms: HashSet<String> = world::read().unwrap_or_default().into_iter().collect();
+    let mut visited = HashSet::new();
+    let calls_remaining = Cell::new(MAX_EQUERY_CALLS);
+    build_tree(atom_with_version, &world_atoms, MAX_DEPTH, &mut visited, &calls_remaining)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_the_version_suffix() {
+        assert_eq!(strip_version("dev-libs/glib-2.84.0"), "dev-libs/glib");
+        assert_eq!(strip_version("app-emulation/wine-vanilla-11.0"), "app-emulation/wine-vanilla");
+    }
+
+    #[test]
+    fn atom_without_a_version_suffix_is_unchanged() {
+        assert_eq!(strip_version("dev-libs/glib"), "dev-libs/glib");
+    }
+}
