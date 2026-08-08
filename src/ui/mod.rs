@@ -1558,7 +1558,14 @@ impl App {
                 job: emerge::update_world_job(app.settings.borrow().prefer_binary_packages),
                 label: "System update (@world)".to_string(),
                 mutating: true,
-                retry_with_use_fix: false,
+                // A `--deep --newuse @world` update is at least as likely
+                // to hit a required-USE/keyword/license mismatch or a
+                // circular dependency as a single-package install — there
+                // was no reason this was off here specifically, and
+                // leaving it off meant the same auto-fix dialog a single
+                // install already gets never showed up for the one job
+                // most likely to actually need it.
+                retry_with_use_fix: true,
                 known_atoms: app.pending_update_atoms.borrow().clone(),
             });
         });
