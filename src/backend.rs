@@ -104,6 +104,15 @@ fn same_app(portage_name: &str, flatpak_app: &flatpak::FlatpakApp) -> bool {
     wanted == normalize(&flatpak_app.name) || wanted == normalize(id_tail)
 }
 
+/// Finds a confident Flatpak match for a single Portage package name among
+/// `hits` (e.g. a `flatpak::search` run against that same name) — the
+/// single-package version of `merge_search_results`' own matching, used
+/// by the detail page to offer "Install via Flatpak" without needing a
+/// full search-results merge in hand.
+pub fn find_flatpak_match(portage_name: &str, hits: &[flatpak::FlatpakApp]) -> Option<flatpak::FlatpakApp> {
+    hits.iter().find(|app| same_app(portage_name, app)).cloned()
+}
+
 /// The result of reconciling one query's Portage and Flatpak hits.
 /// Portage stays authoritative for order and content — the caller already
 /// has its own Portage result list on screen; `chips` is purely additive

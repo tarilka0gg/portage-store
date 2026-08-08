@@ -1,3 +1,5 @@
+use crate::backend;
+use crate::flatpak;
 use crate::portage::eix::PackageSummary;
 use crate::portage::emerge::{self, InstallPreview};
 use crate::portage::installed::InstalledPackage;
@@ -1057,6 +1059,60 @@ fn use_flags_group(
     Some(group)
 }
 
+/// One row's worth of icon + label for the "⋮" overflow menu — plain
+/// widgets in a flat button rather than an `adw::ButtonRow`/`ActionRow`,
+/// so the popover reads as a compact menu instead of a second settings
+/// list.
+fn menu_row_content(icon_name: &str, label: &str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row.append(&gtk::Image::from_icon_name(icon_name));
+    let text = gtk::Label::new(Some(label));
+    text.set_xalign(0.0);
+    row.append(&text);
+    row
+}
+
+/// The confirm-and-build dialog shared by both sandbox-build entry
+/// points (the auto-revealed pill after a failed `--pretend`, and the
+/// "⋮" menu's always-available copy of the same option) — kept as one
+/// function so the two can't drift into showing different wording for
+/// the same action.
+fn confirm_sandbox_build(button: &gtk::Button, atom: &str, display_name: &str, on_sandbox_build: &Rc<dyn Fn(String)>) {
+    let Some(window) = button.root().and_downcast::<gtk::Window>() else {
+        return;
+    };
+    let first_run = !crate::portage::sandbox::is_set_up();
+    let body = if first_run {
+        format!(
+            "{display_name} couldn't be resolved on your system directly. This builds it \
+             in an isolated, disposable Gentoo root instead — masks and keyword \
+             restrictions are ignored there, but nothing on your real system is touched.\n\n\
+             This is the first sandbox build: it also downloads and sets up a base system \
+             first (several hundred MB, plus normal build time on top). Continue?"
+        )
+    } else {
+        format!(
+            "Builds {display_name} in the isolated sandbox root, ignoring masks and \
+             keyword restrictions there. Nothing on your real system is touched. Continue?"
+        )
+    };
+    let dialog = adw::AlertDialog::new(Some("Build in Isolated Sandbox?"), Some(&body));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("build", "Build");
+    dialog.set_response_appearance("build", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("build"));
+    dialog.set_close_response("cancel");
+
+    let atom = atom.to_string();
+    let on_sandbox_build = on_sandbox_build.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "build" {
+            on_sandbox_build(atom.clone());
+        }
+    });
+    dialog.present(Some(&window));
+}
+
 /// Builds the package detail page: the hero, the four fact tiles, the long
 /// description, upstream links and the USE flag switches.
 pub fn build(
@@ -1079,6 +1135,13 @@ pub fn build(
     // a mask, keyword mask, or conflict the live system's resolver won't
     // get past.
     on_sandbox_build: Rc<dyn Fn(String)>,
+    // Queues a Flatpak install of whatever match `find_flatpak_match`
+    // turns up for this package — offered from the same overflow menu as
+    // sandbox builds, as the other "route around Portage" option, but for
+    // the opposite reason: not because Portage's resolver failed, but
+    // because installing prebuilt is faster than compiling from source
+    // when there's a confident Flatpak match and no Portage binary.
+    on_flatpak_install: Rc<dyn Fn(flatpak::FlatpakApp)>,
     // Called exactly once, as soon as the description/screenshot
     // enrichment chain (local AppStream, then Flathub, then — only if
     // still needed — Terminal Trove and GitHub) has either filled both or
@@ -1193,8 +1256,9 @@ pub fn build(
 
     // Hidden until a failed `--pretend` run (below) reveals it — this is
     // the escape hatch for exactly that situation, so there's nothing for
-    // it to do before then. Wired once here rather than on every pretend
-    // result, since only its visibility needs to change, not its handler.
+    // it to do before then. Its own dialog logic lives in
+    // `confirm_sandbox_build` below, shared with the "⋮" menu's own copy
+    // of this same option, so the two entry points can't drift apart.
     let sandbox_button = gtk::Button::with_label("Build in Isolated Sandbox");
     sandbox_button.add_css_class("pill");
     sandbox_button.set_visible(false);
@@ -1207,50 +1271,114 @@ pub fn build(
          hundred MB) and can take a while.",
         crate::portage::sandbox::MAX_SANDBOX_INSTANCES
     )));
-    {
+    sandbox_button.connect_clicked({
         let atom = atom.clone();
         let display_name = display_name.clone();
-        sandbox_button.connect_clicked(move |button| {
-            let Some(window) = button.root().and_downcast::<gtk::Window>() else {
-                return;
-            };
-            let first_run = !crate::portage::sandbox::is_set_up();
-            let body = if first_run {
-                format!(
-                    "{display_name} couldn't be resolved on your system directly. This builds it \
-                     in an isolated, disposable Gentoo root instead — masks and keyword \
-                     restrictions are ignored there, but nothing on your real system is touched.\n\n\
-                     This is the first sandbox build: it also downloads and sets up a base system \
-                     first (several hundred MB, plus normal build time on top). Continue?"
-                )
-            } else {
-                format!(
-                    "Builds {display_name} in the isolated sandbox root, ignoring masks and \
-                     keyword restrictions there. Nothing on your real system is touched. Continue?"
-                )
-            };
-            let dialog = adw::AlertDialog::new(Some("Build in Isolated Sandbox?"), Some(&body));
-            dialog.add_response("cancel", "Cancel");
-            dialog.add_response("build", "Build");
-            dialog.set_response_appearance("build", adw::ResponseAppearance::Suggested);
-            dialog.set_default_response(Some("build"));
-            dialog.set_close_response("cancel");
+        let on_sandbox_build = on_sandbox_build.clone();
+        move |button| confirm_sandbox_build(button, &atom, &display_name, &on_sandbox_build)
+    });
 
-            let atom = atom.clone();
-            let on_sandbox_build = on_sandbox_build.clone();
-            dialog.connect_response(None, move |_, response| {
-                if response == "build" {
-                    on_sandbox_build(atom.clone());
+    // --- overflow menu: alternate install routes ---------------------
+    //
+    // Two ways around the normal Portage install, offered from the same
+    // "⋮" menu next to Install rather than as more always-visible
+    // buttons crowding the hero: building in the isolated sandbox (for
+    // when Portage's own resolver won't get past a mask or conflict) and
+    // installing via Flatpak instead (for when compiling from source is
+    // slower than just grabbing a prebuilt Flatpak of the same app).
+    // Both rows exist unconditionally; only the Flatpak one starts
+    // hidden, since whether it applies depends on two async answers
+    // (a confident Flatpak match existing, and Portage having no binary
+    // for this package) that haven't come back yet when the menu is
+    // built.
+    let overflow_menu_button = gtk::MenuButton::new();
+    overflow_menu_button.set_icon_name("view-more-symbolic");
+    overflow_menu_button.set_tooltip_text(Some("More install options"));
+    overflow_menu_button.add_css_class("flat");
+    overflow_menu_button.set_valign(gtk::Align::Center);
+
+    let sandbox_menu_row = gtk::Button::builder().child(&menu_row_content("system-run-symbolic", "Build in Isolated Sandbox")).build();
+    sandbox_menu_row.add_css_class("flat");
+    sandbox_menu_row.connect_clicked({
+        let atom = atom.clone();
+        let display_name = display_name.clone();
+        let on_sandbox_build = on_sandbox_build.clone();
+        let overflow_menu_button = overflow_menu_button.clone();
+        move |button| {
+            overflow_menu_button.popdown();
+            confirm_sandbox_build(button, &atom, &display_name, &on_sandbox_build);
+        }
+    });
+
+    let flatpak_menu_row = gtk::Button::builder().child(&menu_row_content("folder-download-symbolic", "Install via Flatpak Instead")).build();
+    flatpak_menu_row.add_css_class("flat");
+    flatpak_menu_row.set_visible(false);
+    // Filled in once `find_flatpak_match` (below) answers — the row is
+    // hidden until then, so a click on it always has real data behind it.
+    let flatpak_match: Rc<RefCell<Option<flatpak::FlatpakApp>>> = Rc::new(RefCell::new(None));
+    flatpak_menu_row.connect_clicked({
+        let flatpak_match = flatpak_match.clone();
+        let on_flatpak_install = on_flatpak_install.clone();
+        let overflow_menu_button = overflow_menu_button.clone();
+        move |_| {
+            overflow_menu_button.popdown();
+            if let Some(app) = flatpak_match.borrow().clone() {
+                on_flatpak_install(app);
+            }
+        }
+    });
+
+    let overflow_column = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    overflow_column.set_margin_top(6);
+    overflow_column.set_margin_bottom(6);
+    overflow_column.set_margin_start(6);
+    overflow_column.set_margin_end(6);
+    overflow_column.append(&sandbox_menu_row);
+    overflow_column.append(&flatpak_menu_row);
+    let overflow_popover = gtk::Popover::new();
+    overflow_popover.set_child(Some(&overflow_column));
+    overflow_menu_button.set_popover(Some(&overflow_popover));
+
+    // Whether Portage has no binary for this package — set once the
+    // `--pretend` run below answers (see `apply_pretend_result`); the
+    // Flatpak row only makes sense to offer as a *faster* alternative
+    // when the normal path would mean compiling from source, not when a
+    // Portage binary is already the plan.
+    let needs_source_build = Rc::new(Cell::new(false));
+
+    // Looked up in the background, off the critical path for the page
+    // itself opening — a name-based `flatpak search` plus the same
+    // confidence check `backend::merge_search_results` uses for search
+    // results, just for this one package. Reveals `flatpak_menu_row`
+    // only once both this and the pretend result (whichever answers
+    // second) agree the option is worth showing.
+    {
+        let package_name = pkg.name.clone();
+        let flatpak_match_write = flatpak_match.clone();
+        let flatpak_menu_row_write = flatpak_menu_row.clone();
+        let needs_source_build_read = needs_source_build.clone();
+        runtime::spawn_blocking(
+            move || flatpak::search(&package_name).ok().and_then(|hits| backend::find_flatpak_match(&package_name, &hits)),
+            move |found| {
+                if let Some(app) = found {
+                    *flatpak_match_write.borrow_mut() = Some(app);
+                    flatpak_menu_row_write.set_visible(needs_source_build_read.get());
                 }
-            });
-            dialog.present(Some(&window));
-        });
+            },
+        );
     }
+
+    // Install/Remove plus the "⋮" overflow menu sit side by side — the
+    // menu is a permanent fixture next to the primary action, not
+    // something that only appears once there's a reason for it.
+    let action_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    action_row.append(&action_button);
+    action_row.append(&overflow_menu_button);
 
     let action_column = gtk::Box::new(gtk::Orientation::Vertical, 6);
     action_column.set_valign(gtk::Align::Center);
     action_column.set_halign(gtk::Align::End);
-    action_column.append(&action_button);
+    action_column.append(&action_row);
     action_column.append(&progress_bar);
     action_column.append(&sandbox_button);
 
@@ -1907,6 +2035,9 @@ pub fn build(
     let sandbox_button_write = sandbox_button.clone();
     let disk_space_banner_write = disk_space_banner.clone();
     let blocker_banner_write = blocker_banner.clone();
+    let needs_source_build_write = needs_source_build.clone();
+    let flatpak_menu_row_write = flatpak_menu_row.clone();
+    let flatpak_match_read = flatpak_match.clone();
     // Factored out of the `spawn_job` call below so a cache hit (see
     // `emerge::cached_pretend`) can run the exact same "now show it"
     // logic immediately, without a job — a `--pretend` run does a full
@@ -1994,6 +2125,13 @@ pub fn build(
         // remote repo is even asked, and this stays name-heuristic-only.
         let binhost_prebuilt = !preview.will_compile && preview.packages_to_build > 0;
         let effectively_prebuilt = prebuilt || binhost_prebuilt;
+
+        // Only meaningful once the resolver actually succeeded — a
+        // failed run's "would it compile" answer isn't trustworthy (it
+        // may not have gotten far enough to know), and the sandbox
+        // option already covers "the resolver failed" on its own.
+        needs_source_build_write.set(success && !effectively_prebuilt);
+        flatpak_menu_row_write.set_visible(needs_source_build_write.get() && flatpak_match_read.borrow().is_some());
 
         method_value_clone.set_text(&if !success {
             emerge::failure_reason(&lines)

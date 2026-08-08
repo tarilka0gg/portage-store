@@ -230,10 +230,14 @@ fn push_resolver(nav: &adw::NavigationView, update: PendingUpdate, on_resolved: 
             column.append(&hunks);
             column.append(&actions);
 
+            // No horizontal scrollbar policy override here (unlike the
+            // list page): unwrapped monospace diff lines are exactly the
+            // content that benefits from the dialog's now window-relative
+            // width, and a hidden scrollbar would silently clip a line
+            // too long even for that.
             let scroller = gtk::ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Never)
                 .vexpand(true)
-                .child(&adw::Clamp::builder().maximum_size(760).child(&column).build())
+                .child(&adw::Clamp::builder().maximum_size(960).child(&column).build())
                 .build();
 
             let toolbar = adw::ToolbarView::new();
@@ -362,7 +366,14 @@ pub fn present(anchor: &impl IsA<gtk::Widget>, updates: Vec<PendingUpdate>, on_r
     let list_page = adw::NavigationPage::builder().title("Config File Updates").child(&toolbar).build();
     nav.add(&list_page);
 
-    let dialog =
-        adw::Dialog::builder().title("Config File Updates").content_width(680).content_height(760).child(&nav).build();
+    let dialog = adw::Dialog::builder().title("Config File Updates").content_height(760).child(&nav).build();
+    // Sized off the actual window instead of a flat pixel value — the
+    // diff page's lines are deliberately unwrapped (`set_wrap(false)` in
+    // `change_widget`/`context_widget`, so diff alignment stays intact),
+    // and a fixed narrow width meant they'd wrap-scroll even on a window
+    // with plenty of room to just show them. Clamped so it neither
+    // shrinks below the list page's own comfortable width nor balloons
+    // absurdly wide on an ultrawide monitor.
+    dialog.set_content_width((window.width() - 120).clamp(680, 1000));
     dialog.present(Some(&window));
 }

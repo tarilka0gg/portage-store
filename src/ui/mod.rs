@@ -2277,6 +2277,7 @@ impl App {
                 let install_app = app.clone();
                 let uninstall_app = app.clone();
                 let sandbox_app = app.clone();
+                let flatpak_app = app.clone();
 
                 // `on_ready` needs the built page to push it, but the page
                 // isn't built until `detail::build` returns — which itself
@@ -2303,6 +2304,7 @@ impl App {
                     Rc::new(move |atom: String| install_app.install(atom)),
                     Rc::new(move |atom: String| uninstall_app.uninstall(atom)),
                     Rc::new(move |atom: String| sandbox_app.sandbox_build(atom)),
+                    Rc::new(move |fp_app: flatpak::FlatpakApp| flatpak_app.present_flatpak_detail(fp_app)),
                     on_ready,
                 );
                 *held_page.borrow_mut() = Some(page);
