@@ -50,6 +50,14 @@ pub struct Settings {
     /// runs whenever its own timer fires.
     #[serde(default)]
     pub periodic_health_checks: bool,
+    /// Whether the first-run setup wizard has already been shown —
+    /// checked, not "has settings.json ever existed", since someone who
+    /// dismisses the wizard shouldn't see it again just because they
+    /// also flipped some other setting first. Set once the wizard is
+    /// actually dismissed (skipped or finished), not the moment it
+    /// opens, so a crash mid-wizard doesn't silently mark it seen.
+    #[serde(default)]
+    pub onboarding_shown: bool,
 }
 
 fn default_true() -> bool {
@@ -64,6 +72,7 @@ impl Default for Settings {
             throttle_builds: true,
             night_builds_only: false,
             periodic_health_checks: false,
+            onboarding_shown: false,
         }
     }
 }

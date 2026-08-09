@@ -5,6 +5,7 @@ mod depclean;
 mod detail;
 mod health;
 mod news;
+mod onboarding;
 mod why_installed;
 mod preferences;
 mod runtime;
@@ -917,6 +918,7 @@ impl App {
         maintenance_menu.append(Some("Sync Package Tree"), Some("win.sync"));
         maintenance_menu.append(Some("Free Up Space"), Some("win.cleanup"));
         maintenance_menu.append(Some("Remove Orphaned Packages"), Some("win.depclean"));
+        maintenance_menu.append(Some("Setup Wizard"), Some("win.onboarding"));
 
         let menu = gtk::gio::Menu::new();
         menu.append_submenu(Some("Maintenance"), &maintenance_menu);
@@ -1585,6 +1587,18 @@ impl App {
         let app = self.clone();
         depclean.connect_activate(move |_, _| depclean::present(&app));
         self.window.add_action(&depclean);
+
+        // Reachable any time, not just on first run — revisiting it
+        // later (a fresh install of a starter pick, or just wanting the
+        // quick scan again) doesn't need `onboarding_shown` touched at
+        // all, since that flag only ever gates the *automatic* showing.
+        let onboarding_action = gtk::gio::SimpleAction::new("onboarding", None);
+        let app = self.clone();
+        onboarding_action.connect_activate(move |_, _| {
+            let on_dismissed: Rc<dyn Fn()> = Rc::new(|| {});
+            onboarding::present(&app, on_dismissed);
+        });
+        self.window.add_action(&onboarding_action);
     }
 
     fn connect_signals(
@@ -1670,7 +1684,36 @@ impl App {
         if remaining == 0 {
             self.root_stack.set_visible_child_name("content");
             self.startup_spinner.set_spinning(false);
+            self.maybe_show_onboarding();
         }
+    }
+
+    /// Shows the first-run wizard once, the first time the real content
+    /// is actually on screen — not immediately on `mark_startup_task_done`
+    /// itself, since `check_updates()`'s own pretend run (kicked off
+    /// around the same time as the two tasks gating this) is often still
+    /// in flight then, and the wizard's own quick-scan numbers read
+    /// straight off `pending_update_atoms` rather than watching for it.
+    /// A short, fixed delay is a pragmatic best-effort here, not a
+    /// guarantee — the same "Checking…" placeholder pattern used
+    /// elsewhere would need `check_updates` itself reworked to notify a
+    /// second listener, which is more machinery than a one-time welcome
+    /// screen's own numbers being occasionally a beat stale justifies.
+    fn maybe_show_onboarding(self: &Rc<Self>) {
+        if self.settings.borrow().onboarding_shown {
+            return;
+        }
+        let app = self.clone();
+        gtk::glib::timeout_add_seconds_local_once(2, move || {
+            let on_dismissed: Rc<dyn Fn()> = {
+                let app = app.clone();
+                Rc::new(move || {
+                    app.settings.borrow_mut().onboarding_shown = true;
+                    settings::save(&app.settings.borrow());
+                })
+            };
+            onboarding::present(&app, on_dismissed);
+        });
     }
 
     /// Fills the featured area with one named section per curated theme
