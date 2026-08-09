@@ -1,8 +1,22 @@
 use super::App;
-use crate::portage::{depclean, emerge, glsa, sync};
+use crate::portage::{depclean, emerge, glsa, health_history, sync};
 use crate::ui::runtime;
 use adw::prelude::*;
+use std::cell::Cell;
 use std::rc::Rc;
+
+/// " · pending N days", or nothing at all if there's no history yet or
+/// the metric only just became nonzero — a snapshot's own point-in-time
+/// count already says "3 pending"; this is the extra context that turns
+/// that into "3 pending, and it's been like that for 9 days", which is
+/// the actual trigger for finally doing something about it.
+fn pending_days_suffix(history: &[health_history::HealthSnapshot], metric: impl Fn(&health_history::HealthSnapshot) -> usize) -> String {
+    match health_history::days_pending(history, metric) {
+        Some(0) | None => String::new(),
+        Some(1) => " · pending 1 day".to_string(),
+        Some(days) => format!(" · pending {days} days"),
+    }
+}
 
 /// One row: an icon, a title, a subtitle that starts as "Checking…" and
 /// is filled in once its own background check answers, and an optional
@@ -29,6 +43,8 @@ pub fn present(app: &Rc<App>) {
     let list = gtk::ListBox::new();
     list.add_css_class("boxed-list");
     list.set_selection_mode(gtk::SelectionMode::None);
+
+    let history = health_history::history();
 
     // --- News --------------------------------------------------------
     let (news_row, news_action) = check_row("mail-unread-symbolic", "Gentoo News");
@@ -65,7 +81,10 @@ pub fn present(app: &Rc<App>) {
     if pending_config == 0 {
         config_row.set_subtitle("All resolved");
     } else {
-        config_row.set_subtitle(&format!("{pending_config} pending"));
+        config_row.set_subtitle(&format!(
+            "{pending_config} pending{}",
+            pending_days_suffix(&history, |s| s.pending_config)
+        ));
         config_action.set_visible(true);
     }
     list.append(&config_row);
@@ -102,17 +121,42 @@ pub fn present(app: &Rc<App>) {
         glsa_action.connect_clicked(move |_| app.view_stack.set_visible_child_name("updates"));
     }
     list.append(&glsa_row);
+
+    // Recorded once both the GLSA count and the orphan count (below) are
+    // in — a single joint snapshot per dashboard visit, not two partial
+    // ones, so `days_pending` is never fed a snapshot where one metric
+    // is real and the other is a placeholder.
+    let glsa_count_cell: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    let orphan_count_cell: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    let record_snapshot = {
+        let glsa_count_cell = glsa_count_cell.clone();
+        let orphan_count_cell = orphan_count_cell.clone();
+        move || {
+            if let (Some(glsa_count), Some(orphan_count)) = (glsa_count_cell.get(), orphan_count_cell.get()) {
+                health_history::record(unread_news, pending_config, glsa_count, orphan_count);
+            }
+        }
+    };
+
     {
         let glsa_row = glsa_row.clone();
         let glsa_action = glsa_action.clone();
+        let history = history.clone();
+        let glsa_count_cell = glsa_count_cell.clone();
+        let record_snapshot = record_snapshot.clone();
         runtime::spawn_blocking(glsa::list_affected, move |result| {
             let count = result.map(|entries| entries.len()).unwrap_or(0);
             if count == 0 {
                 glsa_row.set_subtitle("No known vulnerabilities");
             } else {
-                glsa_row.set_subtitle(&format!("{count} affecting installed packages"));
+                glsa_row.set_subtitle(&format!(
+                    "{count} affecting installed packages{}",
+                    pending_days_suffix(&history, |s| s.glsa_count)
+                ));
                 glsa_action.set_visible(true);
             }
+            glsa_count_cell.set(Some(count));
+            record_snapshot();
         });
     }
 
@@ -169,19 +213,29 @@ pub fn present(app: &Rc<App>) {
         let collect = lines.clone();
         let orphans_row = orphans_row.clone();
         let orphans_action = orphans_action.clone();
+        let history = history.clone();
         runtime::spawn_job(depclean::pretend_job(), move |line| collect.borrow_mut().push(line), move |_success| {
             let lines = lines.borrow();
             if depclean::needs_update_first(&lines) {
                 orphans_row.set_subtitle("Needs a full update first");
+                // Not a real "zero orphans" answer — recording 0 here
+                // would misreport an unmeasured state as a resolved one.
+                // The joint snapshot for this visit just doesn't happen;
+                // the next visit that actually measures it will.
                 return;
             }
             let count = depclean::parse_candidates(&lines).len();
             if count == 0 {
                 orphans_row.set_subtitle("Nothing to remove");
             } else {
-                orphans_row.set_subtitle(&format!("{count} package(s) no longer needed"));
+                orphans_row.set_subtitle(&format!(
+                    "{count} package(s) no longer needed{}",
+                    pending_days_suffix(&history, |s| s.orphan_count)
+                ));
                 orphans_action.set_visible(true);
             }
+            orphan_count_cell.set(Some(count));
+            record_snapshot();
         });
     }
 

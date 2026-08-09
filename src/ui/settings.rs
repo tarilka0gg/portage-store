@@ -40,6 +40,16 @@ pub struct Settings {
     /// specifically, not a universal default.
     #[serde(default)]
     pub night_builds_only: bool,
+    /// Whether the health checks (news, config updates, GLSAs, orphaned
+    /// packages) re-run on their own every few hours instead of only at
+    /// startup or when the health dashboard is actually opened. Off by
+    /// default — a background check every few hours is a reasonable
+    /// thing to opt into, not a reasonable thing to do to someone by
+    /// default. Separate from `night_builds_only`: this is read-only
+    /// (no build, no resource cost worth gating to off-hours), so it
+    /// runs whenever its own timer fires.
+    #[serde(default)]
+    pub periodic_health_checks: bool,
 }
 
 fn default_true() -> bool {
@@ -53,6 +63,7 @@ impl Default for Settings {
             prefer_binary_packages: true,
             throttle_builds: true,
             night_builds_only: false,
+            periodic_health_checks: false,
         }
     }
 }

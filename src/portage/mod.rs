@@ -12,6 +12,7 @@ pub mod flathub;
 pub mod glsa;
 pub mod github;
 pub mod gentoo_web;
+pub mod health_history;
 pub mod emerge;
 pub mod icons;
 pub mod installed;

@@ -910,6 +910,7 @@ impl App {
         advanced_menu.append(Some("GitHub Page Preview"), Some("win.github-preview"));
         advanced_menu.append(Some("Throttle Builds (nice/ionice + MAKEOPTS)"), Some("win.throttle-builds"));
         advanced_menu.append(Some("Collect at Night Only"), Some("win.night-builds-only"));
+        advanced_menu.append(Some("Periodic Health Checks"), Some("win.periodic-health-checks"));
 
         let maintenance_menu = gtk::gio::Menu::new();
         maintenance_menu.append(Some("System Health"), Some("win.health"));
@@ -1359,6 +1360,7 @@ impl App {
         }
         app.install_header_gesture(&header);
         app.install_window_actions();
+        app.install_keyboard_shortcuts();
         app.connect_signals(&tiles, &update_all, &refresh_button);
         app.rescan_installed();
         app.check_updates();
@@ -1367,6 +1369,22 @@ impl App {
         app.check_glsa();
         app.check_sync();
         app.populate_featured_carousel();
+
+        // Ticks every 6 hours; the setting itself (checked inside the
+        // closure, not by whether the timer exists) is what decides
+        // whether that tick actually does anything — this way flipping
+        // the toggle on takes effect from the very next tick without
+        // needing to restart the app.
+        {
+            let app_for_timer = app.clone();
+            gtk::glib::timeout_add_seconds_local(6 * 60 * 60, move || {
+                if app_for_timer.settings.borrow().periodic_health_checks {
+                    app_for_timer.run_periodic_health_check();
+                }
+                gtk::glib::ControlFlow::Continue
+            });
+        }
+
         app
     }
 
@@ -1397,6 +1415,48 @@ impl App {
             }
         });
         header.add_controller(gesture);
+    }
+
+    /// A small, deliberately terminal-flavored keyboard layer on top of
+    /// GTK's own tab/arrow-key navigation, since the actual audience here
+    /// already lives with a keyboard-first workflow: `/` jumps straight
+    /// to search (the same convention GitHub, Gmail, and `less` all use)
+    /// and `j`/`k`/`h`/`l` move focus through whichever grid is currently
+    /// showing, the same directions vim itself uses. Both are ignored
+    /// the moment focus is actually inside a text field — a `j` typed
+    /// into the search box must stay a `j`, not a navigation command.
+    fn install_keyboard_shortcuts(self: &Rc<Self>) {
+        let controller = gtk::EventControllerKey::new();
+        let app = self.clone();
+        controller.connect_key_pressed(move |_, keyval, _, state| {
+            // Any modifier combo already means something else (Ctrl+F,
+            // Alt+Tab, ...) — never intercept those.
+            if state.intersects(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::ALT_MASK) {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let typing = gtk::prelude::RootExt::focus(&app.window).is_some_and(|w| w.is::<gtk::Text>());
+
+            if keyval == gtk::gdk::Key::slash && !typing {
+                app.search_bar.set_search_mode(true);
+                app.search_entry.grab_focus();
+                return gtk::glib::Propagation::Stop;
+            }
+            if typing {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let direction = match keyval {
+                gtk::gdk::Key::j => Some(gtk::DirectionType::Down),
+                gtk::gdk::Key::k => Some(gtk::DirectionType::Up),
+                gtk::gdk::Key::h => Some(gtk::DirectionType::Left),
+                gtk::gdk::Key::l => Some(gtk::DirectionType::Right),
+                _ => None,
+            };
+            match direction {
+                Some(direction) if app.window.child_focus(direction) => gtk::glib::Propagation::Stop,
+                _ => gtk::glib::Propagation::Proceed,
+            }
+        });
+        self.window.add_controller(controller);
     }
 
     fn install_window_actions(self: &Rc<Self>) {
@@ -1483,6 +1543,20 @@ impl App {
             }
         });
         self.window.add_action(&night_builds_only);
+
+        let periodic_health_checks = gtk::gio::SimpleAction::new_stateful(
+            "periodic-health-checks",
+            None,
+            &self.settings.borrow().periodic_health_checks.to_variant(),
+        );
+        let app = self.clone();
+        periodic_health_checks.connect_activate(move |action, _| {
+            let enabled = !action.state().and_then(|v| v.get::<bool>()).unwrap_or(false);
+            action.set_state(&enabled.to_variant());
+            app.settings.borrow_mut().periodic_health_checks = enabled;
+            settings::save(&app.settings.borrow());
+        });
+        self.window.add_action(&periodic_health_checks);
 
         let health = gtk::gio::SimpleAction::new("health", None);
         let app = self.clone();
@@ -2004,6 +2078,58 @@ impl App {
                 _ => app.sync_banner.set_revealed(false),
             }
         });
+    }
+
+    /// The opt-in "collect trend history without needing to open the
+    /// health dashboard" path — refreshes the same four visible signals
+    /// (news banner, config banner, GLSA badge, orphan count) the
+    /// dashboard's own checks already produce, and records one joint
+    /// snapshot to `health_history` so "pending N days" has data to work
+    /// from even for someone who never opens the dashboard itself.
+    /// Read-only end to end, so unlike a build job there's no reason to
+    /// gate this to `night_builds_only`'s off-hours window.
+    fn run_periodic_health_check(self: &Rc<Self>) {
+        self.check_news();
+        self.check_config_protect();
+        self.check_glsa();
+        self.check_sync();
+
+        runtime::spawn_blocking(
+            move || {
+                let unread_news =
+                    crate::portage::news::list().map(|items| items.iter().filter(|i| i.unread).count()).unwrap_or(0);
+                let pending_config = crate::portage::config_protect::scan().len();
+                let glsa_count = crate::portage::glsa::list_affected().map(|entries| entries.len()).unwrap_or(0);
+                // Shelled out directly rather than through the job queue
+                // (`depclean::pretend_job`) — this only needs a final
+                // parsed count, not live streamed progress, so the
+                // simpler synchronous call is enough.
+                let orphan_count = std::process::Command::new("emerge")
+                    .args(["--pretend", "--depclean"])
+                    .output()
+                    .ok()
+                    .map(|output| {
+                        let lines: Vec<String> =
+                            String::from_utf8_lossy(&output.stdout).lines().map(String::from).collect();
+                        if crate::portage::depclean::needs_update_first(&lines) {
+                            None
+                        } else {
+                            Some(crate::portage::depclean::parse_candidates(&lines).len())
+                        }
+                    })
+                    .unwrap_or(None);
+                (unread_news, pending_config, glsa_count, orphan_count)
+            },
+            move |(unread_news, pending_config, glsa_count, orphan_count)| {
+                // A `None` orphan count (couldn't measure it — needs a
+                // full update first) skips recording entirely, same as
+                // the dashboard's own joint-snapshot logic: 0 would
+                // misreport an unmeasured state as a resolved one.
+                if let Some(orphan_count) = orphan_count {
+                    crate::portage::health_history::record(unread_news, pending_config, glsa_count, orphan_count);
+                }
+            },
+        );
     }
 
     fn show_updates(self: &Rc<Self>, atoms: Vec<String>, download_kib: Option<u64>) {

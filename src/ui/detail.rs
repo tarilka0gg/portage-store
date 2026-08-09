@@ -977,6 +977,7 @@ fn link_row(icon_name: &str, title: &str, url: &str) -> adw::ActionRow {
 fn use_flags_group(
     pkg: &PackageSummary,
     installed_pkg: Option<&InstalledPackage>,
+    installed: &HashMap<String, InstalledPackage>,
 ) -> Option<adw::PreferencesGroup> {
     if pkg.iuse.is_empty() {
         return None;
@@ -1000,11 +1001,29 @@ fn use_flags_group(
             flag.default_enabled
         };
 
-        let row = adw::SwitchRow::builder()
-            .title(&flag.name)
-            .subtitle(use_desc::describe(&atom, &flag.name).unwrap_or_default())
-            .active(enabled)
-            .build();
+        // A rough "impact" signal, not a bundle preset: how many *other*
+        // installed packages already have this exact flag turned on.
+        // Nothing here claims to know a "coherent" flag combination for
+        // a use case (that's genuinely package-specific domain
+        // knowledge this app has no reliable source for) — but a flag
+        // that's already on across a dozen other packages reads very
+        // differently from one that's genuinely local to this package,
+        // and that distinction is worth surfacing before flipping it.
+        let other_packages_with_flag = installed
+            .values()
+            .filter(|other| other.category != pkg.category || other.name != pkg.name)
+            .filter(|other| other.enabled_use.contains(&flag.name))
+            .count();
+        let description = use_desc::describe(&atom, &flag.name).unwrap_or_default();
+        let subtitle = match other_packages_with_flag {
+            0 => description,
+            1 if description.is_empty() => "Also on 1 other installed package".to_string(),
+            1 => format!("{description} · also on 1 other installed package"),
+            n if description.is_empty() => format!("Also on {n} other installed packages"),
+            n => format!("{description} · also on {n} other installed packages"),
+        };
+
+        let row = adw::SwitchRow::builder().title(&flag.name).subtitle(subtitle).active(enabled).build();
 
         // "Where is this flag" — the most common USE-flag confusion is a
         // value that doesn't match what was expected because something
@@ -2339,7 +2358,7 @@ pub fn build(
     content.append(&group);
 
     // --- USE flags ---------------------------------------------------
-    if let Some(group) = use_flags_group(pkg, installed_pkg) {
+    if let Some(group) = use_flags_group(pkg, installed_pkg, installed) {
         content.append(&group);
     }
 
