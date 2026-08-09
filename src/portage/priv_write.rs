@@ -149,3 +149,44 @@ pub fn remove_file_as_root(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Applies `pairs` (each a `(live_path, proposed_path)`, in the shape
+/// `write_then_remove_as_root` already handles one at a time) as a
+/// *single* privileged operation — one `pkexec` call, one polkit
+/// authentication, for however many files there are. Calling
+/// `write_then_remove_as_root` once per file for a bulk "accept
+/// everything" action means one polkit prompt *per file*, back to back —
+/// which reads as broken (the first prompt appears, then nothing
+/// visibly happens for the rest) rather than as N legitimate requests.
+/// Paths are passed as positional arguments to the script, not
+/// interpolated into its source, so nothing about any of them needs
+/// shell-escaping.
+pub fn write_then_remove_many_as_root(pairs: &[(&Path, &Path)]) -> Result<()> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let mut command = Command::new("pkexec");
+    command.arg("bash").arg("-c").arg(BULK_WRITE_THEN_REMOVE_SCRIPT).arg("bash");
+    for (live_path, proposed_path) in pairs {
+        command.arg(live_path).arg(proposed_path);
+    }
+    let out = command.output().context("failed to launch pkexec")?;
+    if !out.status.success() {
+        bail!("failed to apply {} update(s): {}", pairs.len(), String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(())
+}
+
+/// `$@` is `live_path proposed_path` pairs, flattened — `cp` (not a
+/// stdin pipe, since there's no single content stream for N files) the
+/// proposed content onto the live file, then remove the now-applied
+/// `._cfgNNNN_` file, once per pair.
+const BULK_WRITE_THEN_REMOVE_SCRIPT: &str = r#"set -euo pipefail
+while [ "$#" -ge 2 ]; do
+    live="$1"
+    proposed="$2"
+    shift 2
+    cp -- "$proposed" "$live"
+    rm -f -- "$proposed"
+done
+"#;

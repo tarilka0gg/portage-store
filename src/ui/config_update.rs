@@ -418,25 +418,23 @@ pub fn present(anchor: &impl IsA<gtk::Widget>, updates: Vec<PendingUpdate>, on_r
                 let on_resolved = on_resolved.clone();
                 let button = button.clone();
                 runtime::spawn_blocking(
-                    move || {
-                        let failures: Vec<String> = updates
-                            .iter()
-                            .filter_map(|update| config_protect::take_theirs(update).err().map(|err| format!("{}: {err}", update.file_name())))
-                            .collect();
-                        failures
-                    },
-                    move |failures| {
+                    move || config_protect::take_theirs_bulk(&updates).map_err(|e| e.to_string()),
+                    move |result| {
                         on_resolved();
-                        if failures.is_empty() {
-                            dialog.close();
-                        } else {
-                            // Left open (with whatever's now stale in the
-                            // list) rather than silently closing over a
-                            // partial failure — `on_resolved`'s own
-                            // rescan already refreshed the app-level
-                            // banner/count, but this dialog's own
-                            // snapshot won't reflect it until reopened.
-                            button.set_sensitive(true);
+                        match result {
+                            Ok(()) => {
+                                dialog.close();
+                            }
+                            Err(_) => {
+                                // Left open rather than silently closing
+                                // over a failure — `bash`'s own `set -e`
+                                // means an early file failing leaves the
+                                // rest unapplied too, so there's nothing
+                                // partial to reconcile here, just "try
+                                // again" (or resolve the problem file by
+                                // hand first).
+                                button.set_sensitive(true);
+                            }
                         }
                     },
                 );

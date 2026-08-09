@@ -160,6 +160,16 @@ pub fn take_theirs(update: &PendingUpdate) -> Result<()> {
     priv_write::write_then_remove_as_root(&update.live_path, &content, &update.proposed_path)
 }
 
+/// `take_theirs` for every update in `updates`, as one privileged
+/// operation instead of one per file — see
+/// `priv_write::write_then_remove_many_as_root` for why that distinction
+/// actually matters (one polkit prompt for the whole batch, not one per
+/// file in a row).
+pub fn take_theirs_bulk(updates: &[PendingUpdate]) -> Result<()> {
+    let pairs: Vec<(&Path, &Path)> = updates.iter().map(|u| (u.live_path.as_path(), u.proposed_path.as_path())).collect();
+    priv_write::write_then_remove_many_as_root(&pairs)
+}
+
 /// Discards the proposed file: live file is left exactly as it is, and
 /// the `._cfgNNNN_` file is cleared.
 pub fn keep_mine(update: &PendingUpdate) -> Result<()> {
