@@ -684,10 +684,48 @@ fn rebuild_env_page(page: &adw::PreferencesPage, added_groups: &Rc<RefCell<Vec<a
         files_group.add(&adw::ActionRow::builder().title("None yet").subtitle("Add one below").build());
     }
     for file in &files {
-        let first_line = file.content.lines().next().unwrap_or("").trim();
-        let subtitle = if file.content.lines().count() > 1 { format!("{first_line} …") } else { first_line.to_string() };
-        let row = adw::ActionRow::builder().title(&file.name).subtitle(subtitle).activatable(true).build();
+        // An `ExpanderRow` rather than a plain row with a truncated
+        // first-line subtitle — a one-line preview was hiding exactly
+        // the part that actually mattered for a file with several
+        // CFLAGS/CXXFLAGS/LDFLAGS-style lines (which is most of them).
+        // Expanding shows the real, full content right there; "Edit"
+        // still opens the actual text editor for changing it.
+        let line_count = file.content.lines().count();
+        let row = adw::ExpanderRow::builder()
+            .title(&file.name)
+            .subtitle(if line_count == 1 { "1 line".to_string() } else { format!("{line_count} lines") })
+            .build();
         row.add_prefix(&gtk::Image::from_icon_name("text-x-script-symbolic"));
+
+        let content_label = gtk::Label::new(Some(if file.content.trim().is_empty() { "(empty)" } else { &file.content }));
+        content_label.set_xalign(0.0);
+        content_label.set_wrap(true);
+        content_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        content_label.add_css_class("monospace");
+        content_label.add_css_class("caption");
+        content_label.set_selectable(true);
+        content_label.set_margin_top(6);
+        content_label.set_margin_bottom(10);
+        content_label.set_margin_start(12);
+        content_label.set_margin_end(12);
+        row.add_row(&content_label);
+
+        let edit_button = gtk::Button::from_icon_name("document-edit-symbolic");
+        edit_button.add_css_class("flat");
+        edit_button.set_valign(gtk::Align::Center);
+        edit_button.set_tooltip_text(Some("Edit"));
+        {
+            let file = file.clone();
+            let page = page.clone();
+            let added_groups = added_groups.clone();
+            edit_button.connect_clicked(move |button| {
+                let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+                let page = page.clone();
+                let added_groups = added_groups.clone();
+                present_env_file_editor(&window, Some(file.clone()), Rc::new(move || rebuild_env_page(&page, &added_groups)));
+            });
+        }
+        row.add_suffix(&edit_button);
 
         let remove_button = gtk::Button::from_icon_name("user-trash-symbolic");
         remove_button.add_css_class("flat");
@@ -706,17 +744,6 @@ fn rebuild_env_page(page: &adw::PreferencesPage, added_groups: &Rc<RefCell<Vec<a
         }
         row.add_suffix(&remove_button);
 
-        {
-            let file = file.clone();
-            let page = page.clone();
-            let added_groups = added_groups.clone();
-            row.connect_activated(move |row| {
-                let Some(window) = row.root().and_downcast::<gtk::Window>() else { return };
-                let page = page.clone();
-                let added_groups = added_groups.clone();
-                present_env_file_editor(&window, Some(file.clone()), Rc::new(move || rebuild_env_page(&page, &added_groups)));
-            });
-        }
         files_group.add(&row);
     }
     page.add(&files_group);
