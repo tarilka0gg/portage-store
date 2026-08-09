@@ -126,6 +126,95 @@ pub fn import(bundle: &ExtractedBundle) -> Result<()> {
     Ok(())
 }
 
+/// One `package.use` disagreement between two machines — an atom+flag
+/// this bundle sets differently (or not at all) from how the live system
+/// currently has it. `None` on either side means "not mentioned there",
+/// not "explicitly unset" — portage itself treats an absent entry as
+/// "use the ebuild's own default", which this doesn't try to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UseFlagDiff {
+    pub atom: String,
+    pub flag: String,
+    pub bundle: Option<bool>,
+    pub here: Option<bool>,
+}
+
+/// What moving to `bundle` would actually change on this machine —
+/// the "this machine has 14 packages / 6 USE flags yours doesn't" view,
+/// computed before touching anything so an import can be reviewed (and,
+/// on the atom side, cherry-picked) rather than trusted blind.
+pub struct BundleDiff {
+    /// In the bundle's `@world`, not this machine's.
+    pub atoms_only_in_bundle: Vec<String>,
+    /// On this machine's `@world`, not the bundle's.
+    pub atoms_only_here: Vec<String>,
+    pub use_flag_differences: Vec<UseFlagDiff>,
+}
+
+/// Reads every `package.use`-shaped file directly inside `dir` (not
+/// recursive — real `package.use` directories are always flat), merging
+/// them in filename order so a later file's entry for the same atom+flag
+/// wins, matching portage's own directory-application order. Shared by
+/// both sides of `diff`: called once against `/etc/portage/package.use`
+/// and once against the bundle's own copy.
+fn read_package_use_tree(dir: &Path) -> std::collections::BTreeMap<(String, String), bool> {
+    let mut result = std::collections::BTreeMap::new();
+    let Ok(mut entries) = std::fs::read_dir(dir).map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>()) else {
+        return result;
+    };
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        if !entry.path().is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(entry.path()) else { continue };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut tokens = line.split_whitespace();
+            let Some(atom) = tokens.next() else { continue };
+            for tok in tokens {
+                let (flag, enabled) = match tok.strip_prefix('-') {
+                    Some(flag) => (flag, false),
+                    None => (tok, true),
+                };
+                result.insert((atom.to_string(), flag.to_string()), enabled);
+            }
+        }
+    }
+    result
+}
+
+/// Compares `bundle` against the live system: `@world` (via
+/// `super::world::read`) and every `package.use` file under
+/// `/etc/portage/package.use`, both world-readable so this needs no
+/// privilege either.
+pub fn diff(bundle: &ExtractedBundle) -> Result<BundleDiff> {
+    let current_atoms: std::collections::BTreeSet<String> = super::world::read().context("failed to read @world")?.into_iter().collect();
+    let bundle_atoms: std::collections::BTreeSet<String> = bundle.atoms.iter().cloned().collect();
+
+    let atoms_only_in_bundle = bundle_atoms.difference(&current_atoms).cloned().collect();
+    let atoms_only_here = current_atoms.difference(&bundle_atoms).cloned().collect();
+
+    let here_use = read_package_use_tree(Path::new("/etc/portage/package.use"));
+    let bundle_use = read_package_use_tree(&bundle.dir.join(CONFIG_ENTRY).join("package.use"));
+
+    let mut keys: std::collections::BTreeSet<(String, String)> = here_use.keys().cloned().collect();
+    keys.extend(bundle_use.keys().cloned());
+    let use_flag_differences = keys
+        .into_iter()
+        .filter_map(|(atom, flag)| {
+            let here = here_use.get(&(atom.clone(), flag.clone())).copied();
+            let bundle_value = bundle_use.get(&(atom.clone(), flag.clone())).copied();
+            (here != bundle_value).then_some(UseFlagDiff { atom, flag, bundle: bundle_value, here })
+        })
+        .collect();
+
+    Ok(BundleDiff { atoms_only_in_bundle, atoms_only_here, use_flag_differences })
+}
+
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -170,6 +259,34 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&staging);
         let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn package_use_tree_merges_files_in_name_order_last_wins() {
+        let dir = unique_temp_dir("package-use-tree-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("10-first"), "media-gfx/gimp X -wayland\n").unwrap();
+        std::fs::write(dir.join("zz-last"), "media-gfx/gimp wayland\n").unwrap();
+
+        let tree = read_package_use_tree(&dir);
+        assert_eq!(tree.get(&("media-gfx/gimp".to_string(), "X".to_string())), Some(&true));
+        // `zz-last` sorts after `10-first` and flips this one.
+        assert_eq!(tree.get(&("media-gfx/gimp".to_string(), "wayland".to_string())), Some(&true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn package_use_tree_ignores_comments_and_blank_lines() {
+        let dir = unique_temp_dir("package-use-tree-comments-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zz-portage-store"), "# a comment\n\nmedia-gfx/gimp X\n").unwrap();
+
+        let tree = read_package_use_tree(&dir);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree.get(&("media-gfx/gimp".to_string(), "X".to_string())), Some(&true));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

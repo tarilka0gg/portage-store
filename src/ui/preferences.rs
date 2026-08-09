@@ -234,9 +234,13 @@ fn profile_page(app: &Rc<App>) -> adw::PreferencesPage {
                 let import_row = import_row.clone();
                 let app = app.clone();
                 runtime::spawn_blocking(
-                    move || profile_bundle::extract(&path).map_err(|e| e.to_string()),
+                    move || {
+                        let bundle = profile_bundle::extract(&path).map_err(|e| e.to_string())?;
+                        let diff = profile_bundle::diff(&bundle).map_err(|e| e.to_string())?;
+                        Ok::<_, String>((bundle, diff))
+                    },
                     move |result| match result {
-                        Ok(bundle) => confirm_import(&app, bundle),
+                        Ok((bundle, diff)) => present_import_diff(&app, bundle, diff),
                         Err(err) => import_row.set_subtitle(&format!("Couldn't open: {err}")),
                     },
                 );
@@ -247,51 +251,138 @@ fn profile_page(app: &Rc<App>) -> adw::PreferencesPage {
     page
 }
 
-/// Shows what an import would actually do (a config-file overwrite plus
-/// however many packages) before touching anything — importing isn't
-/// undoable the way this app's other `/etc/portage` writes are (that
-/// history is per-file diffs via `config_history`; a bulk profile import
-/// is a directory-wide `cp -a`, not a single tracked write).
-fn confirm_import(app: &Rc<App>, bundle: profile_bundle::ExtractedBundle) {
-    let body = format!(
-        "This will overwrite matching files under /etc/portage with the bundle's versions, \
-         then queue installing {} package(s) from its @world set. This can't be undone \
-         automatically — continue?",
-        bundle.atoms.len()
-    );
-    let dialog = adw::AlertDialog::new(Some("Import Profile Bundle?"), Some(&body));
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("import", "Import");
-    dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("import"));
-    dialog.set_close_response("cancel");
+/// Shows exactly what moving to this bundle would change before touching
+/// anything: which packages it has that this machine doesn't (checkable —
+/// cherry-pick which of those actually get queued), which packages exist
+/// only on this machine (informational; nothing here ever gets removed),
+/// and how many `package.use` entries disagree. Importing isn't undoable
+/// the way this app's other `/etc/portage` writes are (that history is
+/// per-file diffs via `config_history`; a bulk profile import is a
+/// directory-wide `cp -a`, not a single tracked write), so this is the
+/// one look before it happens.
+fn present_import_diff(app: &Rc<App>, bundle: profile_bundle::ExtractedBundle, diff: profile_bundle::BundleDiff) {
+    let dialog = adw::Dialog::builder().title("Import Profile Bundle").content_width(560).content_height(640).build();
 
-    let app_for_response = app.clone();
-    // Wrapped so the response handler (an `Fn`, not `FnOnce` — GTK's
-    // signal connection requires it, even though this dialog only ever
-    // fires one response in practice) can hand the plain, `Send`
-    // `ExtractedBundle` off to the background thread by value instead of
-    // through an `Rc`, which itself isn't `Send`.
-    let bundle = Rc::new(RefCell::new(Some(bundle)));
-    dialog.connect_response(None, move |_, response| {
-        if response != "import" {
-            return;
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    column.set_margin_top(16);
+    column.set_margin_bottom(24);
+    column.set_margin_start(16);
+    column.set_margin_end(16);
+
+    let intro = gtk::Label::new(Some(
+        "Writes /etc/portage as root (existing files not mentioned in the bundle are left alone), \
+         then queues installing whichever packages below are checked.",
+    ));
+    intro.set_wrap(true);
+    intro.set_xalign(0.0);
+    intro.add_css_class("dim-label");
+    column.append(&intro);
+
+    // Cherry-pickable: every atom here defaults checked, but nothing
+    // says a bundle from a very different machine should be installed
+    // wholesale — a laptop importing a desktop's profile might
+    // deliberately skip its `x11-drivers/nvidia-drivers` pick, say.
+    let new_atoms_group = adw::PreferencesGroup::builder()
+        .title(format!("Packages to Add ({})", diff.atoms_only_in_bundle.len()))
+        .description("On the bundle's @world, not this machine's — checked ones get queued for install.")
+        .build();
+    let checkboxes: Rc<RefCell<Vec<(String, gtk::CheckButton)>>> = Rc::new(RefCell::new(Vec::new()));
+    if diff.atoms_only_in_bundle.is_empty() {
+        new_atoms_group.add(&adw::ActionRow::builder().title("Nothing — already up to date with this bundle").build());
+    } else {
+        for atom in &diff.atoms_only_in_bundle {
+            let row = adw::ActionRow::builder().title(atom).build();
+            let check = gtk::CheckButton::new();
+            check.set_active(true);
+            check.set_valign(gtk::Align::Center);
+            row.add_prefix(&check);
+            row.set_activatable_widget(Some(&check));
+            new_atoms_group.add(&row);
+            checkboxes.borrow_mut().push((atom.clone(), check));
         }
+    }
+    column.append(&new_atoms_group);
+
+    if !diff.atoms_only_here.is_empty() {
+        let here_only = adw::ExpanderRow::builder()
+            .title(format!("Only on This Machine ({})", diff.atoms_only_here.len()))
+            .subtitle("Not touched — importing never removes packages")
+            .build();
+        for atom in &diff.atoms_only_here {
+            here_only.add_row(&adw::ActionRow::builder().title(atom).build());
+        }
+        let group = adw::PreferencesGroup::new();
+        group.add(&here_only);
+        column.append(&group);
+    }
+
+    if !diff.use_flag_differences.is_empty() {
+        let use_diffs = adw::ExpanderRow::builder()
+            .title(format!("USE Flag Differences ({})", diff.use_flag_differences.len()))
+            .subtitle("Applied as part of the /etc/portage write above")
+            .build();
+        for d in &diff.use_flag_differences {
+            let format_side = |v: Option<bool>| match v {
+                Some(true) => format!("+{}", d.flag),
+                Some(false) => format!("-{}", d.flag),
+                None => "(unset)".to_string(),
+            };
+            let row = adw::ActionRow::builder()
+                .title(&d.atom)
+                .subtitle(format!("bundle: {}  ·  here: {}", format_side(d.bundle), format_side(d.here)))
+                .build();
+            use_diffs.add_row(&row);
+        }
+        let group = adw::PreferencesGroup::new();
+        group.add(&use_diffs);
+        column.append(&group);
+    }
+
+    let import_button = gtk::Button::with_label("Import");
+    import_button.add_css_class("suggested-action");
+    import_button.add_css_class("pill");
+    import_button.set_halign(gtk::Align::Center);
+    column.append(&import_button);
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&adw::Clamp::builder().maximum_size(560).child(&column).build())
+        .build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scroller));
+    dialog.set_child(Some(&toolbar));
+
+    // Wrapped so the click handler (an `Fn`, not `FnOnce` — GTK requires
+    // it even though this only ever fires once in practice) can hand the
+    // plain, `Send` `ExtractedBundle` off to the background thread by
+    // value instead of through an `Rc`, which itself isn't `Send`.
+    let bundle = Rc::new(RefCell::new(Some(bundle)));
+    let app_for_click = app.clone();
+    let dialog_for_click = dialog.clone();
+    import_button.connect_clicked(move |button| {
         let Some(bundle) = bundle.borrow_mut().take() else { return };
-        let app = app_for_response.clone();
+        button.set_sensitive(false);
+        let selected_atoms: Vec<String> =
+            checkboxes.borrow().iter().filter(|(_, check)| check.is_active()).map(|(atom, _)| atom.clone()).collect();
+        let app = app_for_click.clone();
+        dialog_for_click.close();
         runtime::spawn_blocking(
-            move || profile_bundle::import(&bundle).map(|()| bundle.atoms.clone()).map_err(|e| e.to_string()),
+            move || profile_bundle::import(&bundle).map_err(|e| e.to_string()),
             move |result| match result {
-                Ok(atoms) => {
-                    let getbinpkg = app.settings.borrow().prefer_binary_packages;
-                    app.enqueue(QueueEntry {
-                        job: emerge::install_many_job(&atoms, getbinpkg),
-                        label: "Installing imported profile's @world set".to_string(),
-                        mutating: true,
-                        retry_with_use_fix: false,
-                        known_atoms: atoms,
-                    });
-                    app.toast("Profile imported — install queued");
+                Ok(()) => {
+                    if !selected_atoms.is_empty() {
+                        let getbinpkg = app.settings.borrow().prefer_binary_packages;
+                        app.enqueue(QueueEntry {
+                            job: emerge::install_many_job(&selected_atoms, getbinpkg),
+                            label: "Installing imported profile's packages".to_string(),
+                            mutating: true,
+                            retry_with_use_fix: false,
+                            known_atoms: selected_atoms.clone(),
+                        });
+                    }
+                    app.toast("Profile imported");
                 }
                 Err(err) => app.toast(&format!("Import failed: {err}")),
             },
