@@ -2925,6 +2925,45 @@ impl App {
         );
     }
 
+    /// Offered after a `--keep-going` `@world` update finishes with some
+    /// (not all) packages failed — the whole point of `--keep-going` is
+    /// that this doesn't have to mean redoing the entire update, just
+    /// the part that actually broke.
+    fn present_keep_going_retry(self: &Rc<Self>, label: &str, failed_atoms: Vec<String>, total: usize) {
+        let title = if failed_atoms.len() == 1 {
+            "1 package failed to update".to_string()
+        } else {
+            format!("{} of {total} packages failed to update", failed_atoms.len())
+        };
+        let body = format!(
+            "{label} kept going past the failure(s) below and merged everything else successfully:\n\n{}\n\n\
+             Retry just these, or leave them for later?",
+            failed_atoms.join("\n")
+        );
+        let dialog = adw::AlertDialog::new(Some(&title), Some(&body));
+        dialog.add_response("dismiss", "Not Now");
+        dialog.add_response("retry", "Retry Failed Only");
+        dialog.set_response_appearance("retry", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("retry"));
+        dialog.set_close_response("dismiss");
+
+        let app = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response != "retry" {
+                return;
+            }
+            let getbinpkg = app.settings.borrow().prefer_binary_packages;
+            app.enqueue(QueueEntry {
+                job: emerge::install_many_job(&failed_atoms, getbinpkg),
+                label: "Retrying failed packages".to_string(),
+                mutating: true,
+                retry_with_use_fix: true,
+                known_atoms: Vec::new(),
+            });
+        });
+        dialog.present(Some(&self.window));
+    }
+
     fn enqueue(self: &Rc<Self>, entry: QueueEntry) {
         let label = entry.label.clone();
         self.queue.borrow_mut().push_back(entry);
@@ -3034,6 +3073,13 @@ impl App {
         // to tell `refresh_detail_action_button` below which way to flip
         // once this job succeeds.
         let job_is_install = !entry.job.args.iter().any(|a| a == "--depclean");
+        // Whether `--keep-going` even applies here — only `update_world_job`
+        // carries it, and only a job with a real, multi-package atom list
+        // up front (i.e. an `@world` update) makes "retry just what
+        // failed" a meaningfully different offer from "retry the whole
+        // job" a single-package install already gets via the USE-fix
+        // retry path.
+        let known_atom_count = entry.known_atoms.len();
 
         // Real progress (a "Jobs: N of M" line) only starts appearing once
         // portage is actually building/merging — dependency resolution and
@@ -3178,12 +3224,29 @@ impl App {
                         dialog.present(Some(&done_app_for_present.window));
                         return;
                     }
+                // `--keep-going` (see `update_world_job`) means a big
+                // `@world` update doesn't have to be all-or-nothing —
+                // everything portage could still merge around a failure
+                // already did. Checked only for a job that started with
+                // a known multi-atom list (i.e. actually an `@world`
+                // update, the one case `--keep-going` is even on): a
+                // single-package install failing has nothing partial
+                // about it, and stays on the existing build-failure path
+                // below.
+                let failed_atoms = (!success && known_atom_count > 0)
+                    .then(|| emerge::parse_failed_packages(&output.borrow()))
+                    .unwrap_or_default();
                 // A real build failure (not the USE-flag block already
                 // handled above, not a resolver issue — an ebuild phase
                 // actually died) gets its own dialog with the log tail and
                 // follow-up actions, rather than just a toast that's easy
                 // to miss and gives no way to actually see what broke.
-                let build_failure = (!success).then(|| emerge::parse_build_failure(&output.borrow())).flatten();
+                // Skipped when `failed_atoms` already has the fuller,
+                // multi-package picture — a single-package die-message
+                // dialog would just be the *first* of potentially several
+                // failures, not the whole story.
+                let build_failure =
+                    (!success && failed_atoms.is_empty()).then(|| emerge::parse_build_failure(&output.borrow())).flatten();
                 // Sent regardless of which branch below fires — a job
                 // that just finished is exactly as worth knowing about
                 // whether the window's in focus or the person's stepped
@@ -3192,7 +3255,9 @@ impl App {
                 // this window happens to be visible right now) doesn't
                 // cover.
                 done_app.send_notification(&label, success);
-                if let Some(failure) = build_failure {
+                if !failed_atoms.is_empty() {
+                    done_app.present_keep_going_retry(&label, failed_atoms, known_atom_count);
+                } else if let Some(failure) = build_failure {
                     build_failure::present(&done_app.window, &label, failure);
                 } else {
                     done_app.toast(&if success {

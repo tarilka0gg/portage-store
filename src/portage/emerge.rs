@@ -518,6 +518,62 @@ fn strip_pkg_version(cpv: &str) -> String {
     cpv.to_string()
 }
 
+/// Pulls the atoms (not full `category/name-version`, so they're directly
+/// re-installable) out of `--keep-going`'s own end-of-run summary — the
+/// list of everything that failed while the rest of a big update kept
+/// going around it. Verified against portage's own source
+/// (`_emerge/Scheduler.py`'s `_failed_pkg_msg`/`_choose_pkg` handling)
+/// for the exact shape, since it's easy to get a rarely-triggered error
+/// path wrong by guessing:
+///
+/// ```text
+///  * The following 2 packages have failed to build, install, or execute postinst:
+///  *
+///  *  media-video/ffmpeg-6.0, Log file:
+///  *   '/var/tmp/portage/media-video/ffmpeg-6.0/temp/build.log'
+///  *  dev-libs/foo-1.0
+///  *
+/// ```
+///
+/// Every line here already carries portage's own `" * "` prefix
+/// (colorized in a real terminal, plain here since output is piped) —
+/// stripped before matching, same as `extract_change_block` does for its
+/// own blocks.
+pub fn parse_failed_packages(lines: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut in_block = false;
+    for line in lines {
+        if line.contains("have failed to build, install, or execute postinst")
+            || line.contains("has failed to build, install, or execute postinst")
+        {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        let content = line.trim_start().trim_start_matches('*').trim();
+        if content.is_empty() {
+            // The header itself is immediately followed by one blank
+            // separator line before the package list even starts — only
+            // a blank line *after* at least one package's been
+            // collected actually marks the end of the block.
+            if result.is_empty() {
+                continue;
+            }
+            break;
+        }
+        // The log-file path continuation line, quoted and indented one
+        // level deeper than the package line itself — not a package.
+        if content.starts_with('\'') {
+            continue;
+        }
+        let atom_version = content.split(',').next().unwrap_or(content).split(" (").next().unwrap_or(content).trim();
+        result.push(strip_pkg_version(atom_version));
+    }
+    result
+}
+
 /// Boils a failed `--pretend` run down to one plain-language sentence.
 /// Portage's own diagnostics are long and jargon-heavy; these are the three
 /// causes a non-expert actually hits, and each has a different fix.
@@ -680,9 +736,15 @@ pub fn uninstall_job(atom: &str) -> Job {
     }
 }
 
-/// A full `@world` update.
+/// A full `@world` update. Runs with `--keep-going`: without it, one
+/// package failing partway through a long update aborts the entire
+/// remaining merge list — everything already resolved and ready to go
+/// gets thrown away over a single unrelated failure. With it, portage
+/// recalculates around the failure and keeps merging everything else,
+/// reporting which package(s) failed at the end (see
+/// `parse_failed_packages`) instead of stopping cold.
 pub fn update_world_job(getbinpkg: bool) -> Job {
-    let mut args = vec!["--ask=n".into(), "--update".into(), "--deep".into(), "--newuse".into()];
+    let mut args = vec!["--ask=n".into(), "--update".into(), "--deep".into(), "--newuse".into(), "--keep-going".into()];
     args.extend(binpkg_args(getbinpkg));
     args.push("@world".into());
     Job { privileged: true, binary: "emerge".into(), args }
@@ -1074,6 +1136,49 @@ mod tests {
     fn strips_versions_with_hyphens_in_the_package_name() {
         assert_eq!(strip_pkg_version("kde-frameworks/kross-6.6.0"), "kde-frameworks/kross");
         assert_eq!(strip_pkg_version("dev-libs/some-lib-r1-2.0-r3"), "dev-libs/some-lib-r1");
+    }
+
+    #[test]
+    fn keep_going_failure_summary_is_parsed_into_atoms() {
+        // Verbatim shape (colors stripped) from portage's own
+        // `_emerge/Scheduler.py` end-of-run `--keep-going` summary.
+        let lines = [
+            " * The following 2 packages have failed to build, install, or execute postinst:",
+            " * ",
+            " *  media-video/ffmpeg-6.0, Log file:",
+            " *   '/var/tmp/portage/media-video/ffmpeg-6.0/temp/build.log'",
+            " *  dev-libs/foo-1.0",
+            " * ",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+
+        assert_eq!(parse_failed_packages(&lines), vec!["media-video/ffmpeg".to_string(), "dev-libs/foo".to_string()]);
+    }
+
+    #[test]
+    fn a_single_failed_package_uses_the_singular_header() {
+        let lines = [" * The following package has failed to build, install, or execute postinst:", " * ", " *  dev-libs/foo-1.0", " * "]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        assert_eq!(parse_failed_packages(&lines), vec!["dev-libs/foo".to_string()]);
+    }
+
+    #[test]
+    fn a_postinst_failure_marker_does_not_get_included_in_the_atom() {
+        let lines = [" * The following package has failed to build, install, or execute postinst:", " * ", " *  dev-libs/foo-1.0 (postinst failed)", " * "]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        assert_eq!(parse_failed_packages(&lines), vec!["dev-libs/foo".to_string()]);
+    }
+
+    #[test]
+    fn no_keep_going_summary_yields_nothing() {
+        let lines = vec!["Some unrelated failure.".to_string()];
+        assert!(parse_failed_packages(&lines).is_empty());
     }
 
     #[test]
