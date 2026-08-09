@@ -360,8 +360,17 @@ pub fn present(anchor: &impl IsA<gtk::Widget>, updates: Vec<PendingUpdate>, on_r
         .child(&adw::Clamp::builder().maximum_size(640).child(&column).build())
         .build();
 
+    let header = adw::HeaderBar::new();
+    // Only worth offering once there's more than one file to save a trip
+    // through — accepting a single pending update is exactly one click
+    // away already via its own row.
+    let accept_all_button = gtk::Button::with_label("Accept All");
+    accept_all_button.set_tooltip_text(Some("Replace every pending file with its updated version"));
+    accept_all_button.set_visible(updates.len() > 1);
+    header.pack_end(&accept_all_button);
+
     let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&scroller));
     let list_page = adw::NavigationPage::builder().title("Config File Updates").child(&toolbar).build();
     nav.add(&list_page);
@@ -375,5 +384,66 @@ pub fn present(anchor: &impl IsA<gtk::Widget>, updates: Vec<PendingUpdate>, on_r
     // shrinks below the list page's own comfortable width nor balloons
     // absurdly wide on an ultrawide monitor.
     dialog.set_content_width((window.width() - 120).clamp(680, 1000));
+
+    {
+        let updates = updates.clone();
+        let dialog = dialog.clone();
+        let on_resolved = on_resolved.clone();
+        accept_all_button.connect_clicked(move |button| {
+            let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+            let body = format!(
+                "This replaces all {} pending file(s) with the version portage proposed, discarding any local \
+                 edits to them. Files with a merge you'd rather resolve by hand should be handled individually \
+                 instead — this can't be undone automatically. Continue?",
+                updates.len()
+            );
+            let confirm = adw::AlertDialog::new(Some("Accept All Config Updates?"), Some(&body));
+            confirm.add_response("cancel", "Cancel");
+            confirm.add_response("accept", "Accept All");
+            confirm.set_response_appearance("accept", adw::ResponseAppearance::Destructive);
+            confirm.set_default_response(Some("cancel"));
+            confirm.set_close_response("cancel");
+
+            let updates = updates.clone();
+            let dialog = dialog.clone();
+            let on_resolved = on_resolved.clone();
+            let button = button.clone();
+            confirm.connect_response(None, move |_, response| {
+                if response != "accept" {
+                    return;
+                }
+                button.set_sensitive(false);
+                let updates = updates.clone();
+                let dialog = dialog.clone();
+                let on_resolved = on_resolved.clone();
+                let button = button.clone();
+                runtime::spawn_blocking(
+                    move || {
+                        let failures: Vec<String> = updates
+                            .iter()
+                            .filter_map(|update| config_protect::take_theirs(update).err().map(|err| format!("{}: {err}", update.file_name())))
+                            .collect();
+                        failures
+                    },
+                    move |failures| {
+                        on_resolved();
+                        if failures.is_empty() {
+                            dialog.close();
+                        } else {
+                            // Left open (with whatever's now stale in the
+                            // list) rather than silently closing over a
+                            // partial failure — `on_resolved`'s own
+                            // rescan already refreshed the app-level
+                            // banner/count, but this dialog's own
+                            // snapshot won't reflect it until reopened.
+                            button.set_sensitive(true);
+                        }
+                    },
+                );
+            });
+            confirm.present(Some(&window));
+        });
+    }
+
     dialog.present(Some(&window));
 }
