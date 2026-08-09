@@ -25,6 +25,7 @@ pub mod news;
 pub mod overlays;
 pub mod terminaltrove;
 pub mod media;
+pub mod package_env;
 pub mod package_use;
 pub mod priv_write;
 pub mod profile_bundle;

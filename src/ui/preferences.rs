@@ -1,6 +1,6 @@
 use super::{App, QueueEntry};
 use crate::portage::overlays::{self, Overlay};
-use crate::portage::{binrepos, config_history, emerge, make_conf, priv_write, profile_bundle, world};
+use crate::portage::{binrepos, config_history, emerge, make_conf, package_env, priv_write, profile_bundle, world};
 use crate::ui::runtime;
 use adw::prelude::*;
 use std::cell::RefCell;
@@ -166,6 +166,7 @@ pub fn present(app: &Rc<App>) {
     dialog.add(&page);
     dialog.add(&binpkg_page());
     dialog.add(&overlays_page());
+    dialog.add(&env_page());
     dialog.add(&profile_page(app));
     dialog.present(Some(parent));
 }
@@ -650,4 +651,269 @@ fn rebuild_binpkg_page(page: &adw::PreferencesPage, added_groups: &Rc<RefCell<Ve
     new_groups.push(add_group);
 
     *added_groups.borrow_mut() = new_groups;
+}
+
+/// The `/etc/portage/env` + `package.env` page — every named environment
+/// override file (raw `CFLAGS`/`FEATURES`/`CC`/... shell fragments, edited
+/// as free text since unlike `package.use` there's no fixed vocabulary of
+/// tokens to build a structured editor around) plus which atoms reference
+/// which files. Rebuilt from scratch after every change, same convention
+/// `binpkg_page`/`overlays_page` already use.
+fn env_page() -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Env Files");
+    page.set_icon_name(Some("text-x-script-symbolic"));
+    let added_groups = Rc::new(RefCell::new(Vec::new()));
+    rebuild_env_page(&page, &added_groups);
+    page
+}
+
+fn rebuild_env_page(page: &adw::PreferencesPage, added_groups: &Rc<RefCell<Vec<adw::PreferencesGroup>>>) {
+    for group in added_groups.borrow_mut().drain(..) {
+        page.remove(&group);
+    }
+    let mut new_groups = Vec::new();
+
+    // --- existing env files ---------------------------------------------
+    let files_group = adw::PreferencesGroup::builder()
+        .title("Environment Files")
+        .description("Shell variable overrides (CFLAGS, FEATURES, CC, ...), applied to whichever atoms reference them below.")
+        .build();
+    let files = package_env::list_env_files().unwrap_or_default();
+    if files.is_empty() {
+        files_group.add(&adw::ActionRow::builder().title("None yet").subtitle("Add one below").build());
+    }
+    for file in &files {
+        let first_line = file.content.lines().next().unwrap_or("").trim();
+        let subtitle = if file.content.lines().count() > 1 { format!("{first_line} …") } else { first_line.to_string() };
+        let row = adw::ActionRow::builder().title(&file.name).subtitle(subtitle).activatable(true).build();
+        row.add_prefix(&gtk::Image::from_icon_name("text-x-script-symbolic"));
+
+        let remove_button = gtk::Button::from_icon_name("user-trash-symbolic");
+        remove_button.add_css_class("flat");
+        remove_button.set_valign(gtk::Align::Center);
+        remove_button.set_tooltip_text(Some("Delete"));
+        {
+            let name = file.name.clone();
+            let page = page.clone();
+            let added_groups = added_groups.clone();
+            remove_button.connect_clicked(move |button| {
+                button.set_sensitive(false);
+                if package_env::delete_env_file(&name).is_ok() {
+                    rebuild_env_page(&page, &added_groups);
+                }
+            });
+        }
+        row.add_suffix(&remove_button);
+
+        {
+            let file = file.clone();
+            let page = page.clone();
+            let added_groups = added_groups.clone();
+            row.connect_activated(move |row| {
+                let Some(window) = row.root().and_downcast::<gtk::Window>() else { return };
+                let page = page.clone();
+                let added_groups = added_groups.clone();
+                present_env_file_editor(&window, Some(file.clone()), Rc::new(move || rebuild_env_page(&page, &added_groups)));
+            });
+        }
+        files_group.add(&row);
+    }
+    page.add(&files_group);
+    new_groups.push(files_group);
+
+    let new_name_row = adw::EntryRow::builder().title("File Name (e.g. no-lto.conf)").build();
+    let add_file_button = gtk::Button::with_label("Create");
+    add_file_button.add_css_class("suggested-action");
+    add_file_button.add_css_class("pill");
+    add_file_button.set_halign(gtk::Align::Center);
+    let add_status = gtk::Label::new(None);
+    add_status.add_css_class("dim-label");
+    add_status.set_wrap(true);
+    {
+        let new_name_row = new_name_row.clone();
+        let add_status = add_status.clone();
+        let page = page.clone();
+        let added_groups = added_groups.clone();
+        add_file_button.connect_clicked(move |button| {
+            let name = new_name_row.text().trim().to_string();
+            if name.is_empty() || name.contains('/') {
+                add_status.set_text("Give it a plain file name, no slashes.");
+                return;
+            }
+            let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+            let page = page.clone();
+            let added_groups = added_groups.clone();
+            present_env_file_editor(
+                &window,
+                Some(package_env::EnvFile { name, content: String::new() }),
+                Rc::new(move || rebuild_env_page(&page, &added_groups)),
+            );
+        });
+    }
+    let add_group = adw::PreferencesGroup::builder().title("Add Environment File").build();
+    add_group.add(&new_name_row);
+    add_group.add(&add_file_button);
+    add_group.add(&add_status);
+    page.add(&add_group);
+    new_groups.push(add_group);
+
+    // --- package.env associations ----------------------------------------
+    let assoc_group = adw::PreferencesGroup::builder()
+        .title("Package Associations")
+        .description("Every atom -> env file mapping currently in effect, system-wide.")
+        .build();
+    let all_associations = package_env::read_all_associations().unwrap_or_default();
+    let managed_associations = package_env::read_managed_associations().unwrap_or_default();
+    if all_associations.is_empty() {
+        assoc_group.add(&adw::ActionRow::builder().title("None yet").subtitle("Add one below").build());
+    }
+    for (atom, env_files) in &all_associations {
+        let row = adw::ActionRow::builder().title(atom).subtitle(env_files.join(", ")).build();
+        row.add_prefix(&gtk::Image::from_icon_name("emblem-symbolic-link-symbolic"));
+        // Only this app's own managed entries are ever removable here —
+        // a line from some hand-edited or other-tool file isn't this
+        // app's place to delete.
+        if let Some(managed_files) = managed_associations.get(atom) {
+            for env_file in managed_files {
+                let remove_button = gtk::Button::from_icon_name("user-trash-symbolic");
+                remove_button.add_css_class("flat");
+                remove_button.set_valign(gtk::Align::Center);
+                remove_button.set_tooltip_text(Some(&format!("Remove {env_file}")));
+                let atom = atom.clone();
+                let env_file = env_file.clone();
+                let page = page.clone();
+                let added_groups = added_groups.clone();
+                remove_button.connect_clicked(move |button| {
+                    button.set_sensitive(false);
+                    if package_env::disassociate(&atom, &env_file).is_ok() {
+                        rebuild_env_page(&page, &added_groups);
+                    }
+                });
+                row.add_suffix(&remove_button);
+            }
+        } else {
+            let badge = gtk::Label::new(Some("system"));
+            badge.add_css_class("dim-label");
+            badge.add_css_class("caption");
+            row.add_suffix(&badge);
+        }
+        assoc_group.add(&row);
+    }
+    page.add(&assoc_group);
+    new_groups.push(assoc_group);
+
+    let atom_row = adw::EntryRow::builder().title("Atom (e.g. sys-devel/gcc)").build();
+    let env_file_row = adw::ComboRow::builder().title("Env File").build();
+    let env_file_names: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
+    let model = gtk::StringList::new(&env_file_names.iter().map(String::as_str).collect::<Vec<_>>());
+    env_file_row.set_model(Some(&model));
+
+    let add_assoc_button = gtk::Button::with_label("Associate");
+    add_assoc_button.add_css_class("suggested-action");
+    add_assoc_button.add_css_class("pill");
+    add_assoc_button.set_halign(gtk::Align::Center);
+    add_assoc_button.set_sensitive(!env_file_names.is_empty());
+    let assoc_status = gtk::Label::new(if env_file_names.is_empty() { Some("Add an environment file above first.") } else { None });
+    assoc_status.add_css_class("dim-label");
+    assoc_status.set_wrap(true);
+    {
+        let atom_row = atom_row.clone();
+        let env_file_row = env_file_row.clone();
+        let env_file_names = env_file_names.clone();
+        let assoc_status = assoc_status.clone();
+        let page = page.clone();
+        let added_groups = added_groups.clone();
+        add_assoc_button.connect_clicked(move |_| {
+            let atom = atom_row.text().trim().to_string();
+            if atom.is_empty() || !atom.contains('/') {
+                assoc_status.set_text("Give it a real category/name atom.");
+                return;
+            }
+            let Some(env_file) = env_file_names.get(env_file_row.selected() as usize) else { return };
+            match package_env::associate(&atom, env_file) {
+                Ok(()) => rebuild_env_page(&page, &added_groups),
+                Err(err) => assoc_status.set_text(&format!("Couldn't save: {err}")),
+            }
+        });
+    }
+    let add_assoc_group = adw::PreferencesGroup::builder().title("Add Association").build();
+    add_assoc_group.add(&atom_row);
+    add_assoc_group.add(&env_file_row);
+    add_assoc_group.add(&add_assoc_button);
+    add_assoc_group.add(&assoc_status);
+    page.add(&add_assoc_group);
+    new_groups.push(add_assoc_group);
+
+    *added_groups.borrow_mut() = new_groups;
+}
+
+/// The env file content editor — a plain multi-line text buffer (these
+/// files are shell fragments, not structured data) with Save/Cancel.
+/// `file.content` empty means this is a brand new file (created on save,
+/// not before) so cancelling out of a just-clicked "Create" leaves
+/// nothing behind.
+fn present_env_file_editor(window: &gtk::Window, file: Option<package_env::EnvFile>, on_saved: Rc<dyn Fn()>) {
+    let Some(file) = file else { return };
+    let dialog = adw::Dialog::builder().title(&file.name).content_width(560).content_height(480).build();
+
+    let text_view = gtk::TextView::new();
+    text_view.set_monospace(true);
+    text_view.set_top_margin(8);
+    text_view.set_bottom_margin(8);
+    text_view.set_left_margin(8);
+    text_view.set_right_margin(8);
+    text_view.buffer().set_text(&file.content);
+
+    let scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&text_view).build();
+    scroller.add_css_class("card");
+
+    let hint = gtk::Label::new(Some("Shell variable assignments, one per line — e.g. CFLAGS=\"-O2 -pipe\""));
+    hint.add_css_class("dim-label");
+    hint.add_css_class("caption");
+    hint.set_xalign(0.0);
+    hint.set_wrap(true);
+
+    let save_button = gtk::Button::with_label("Save");
+    save_button.add_css_class("suggested-action");
+    save_button.add_css_class("pill");
+    save_button.set_halign(gtk::Align::Center);
+
+    let status = gtk::Label::new(None);
+    status.add_css_class("dim-label");
+    status.set_wrap(true);
+
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    column.set_margin_top(12);
+    column.set_margin_bottom(16);
+    column.set_margin_start(12);
+    column.set_margin_end(12);
+    column.append(&hint);
+    column.append(&scroller);
+    column.append(&save_button);
+    column.append(&status);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&column));
+    dialog.set_child(Some(&toolbar));
+
+    {
+        let name = file.name.clone();
+        let text_view = text_view.clone();
+        let dialog_for_save = dialog.clone();
+        save_button.connect_clicked(move |_| {
+            let buffer = text_view.buffer();
+            let content = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+            match package_env::write_env_file(&name, &content) {
+                Ok(()) => {
+                    on_saved();
+                    dialog_for_save.close();
+                }
+                Err(err) => status.set_text(&format!("Couldn't save: {err}")),
+            }
+        });
+    }
+
+    dialog.present(Some(window));
 }
