@@ -11,6 +11,7 @@ pub mod flag_provenance;
 pub mod flathub;
 pub mod glsa;
 pub mod github;
+pub mod gentoo_web;
 pub mod emerge;
 pub mod icons;
 pub mod installed;

@@ -1406,6 +1406,16 @@ pub fn build(
     // package" the Install Method tile alone can show.
     let blocker_banner = adw::Banner::new("");
     content_top.append(&blocker_banner);
+
+    // "Blast radius" — the one detail a package count and a download size
+    // don't say out loud: whether this pulls in a toolchain component
+    // (`emerge::touches_toolchain`), which commonly cascades into a much
+    // bigger rebuild than the package itself would suggest. Shown up
+    // front, before Install is ever clicked, from the exact same
+    // `--pretend` data the fact tiles already parse — not a second run.
+    let toolchain_banner = adw::Banner::new("");
+    toolchain_banner.add_css_class("warning");
+    content_top.append(&toolchain_banner);
     content_top.append(&hero);
 
     // Slot for artwork that may arrive from Flathub later; stays empty and
@@ -2020,6 +2030,7 @@ pub fn build(
     let overflow_menu_button_write = overflow_menu_button.clone();
     let disk_space_banner_write = disk_space_banner.clone();
     let blocker_banner_write = blocker_banner.clone();
+    let toolchain_banner_write = toolchain_banner.clone();
     let needs_source_build_write = needs_source_build.clone();
     let flatpak_menu_row_write = flatpak_menu_row.clone();
     let flatpak_match_read = flatpak_match.clone();
@@ -2036,7 +2047,18 @@ pub fn build(
         // usually knows the size even though it can't proceed.
         let lines = lines_for_apply.borrow();
         let preview: InstallPreview = emerge::parse_pretend_output(&lines);
-        *pending_packages_write.borrow_mut() = emerge::parse_pretend_packages(&lines);
+        let pending = emerge::parse_pretend_packages(&lines);
+        match emerge::touches_toolchain(&pending) {
+            Some(toolchain_atom) => {
+                toolchain_banner_write.set_title(&format!(
+                    "Rebuilds {toolchain_atom} — this can cascade into rebuilding everything linked against it, \
+                     and take far longer than the package count alone suggests"
+                ));
+                toolchain_banner_write.set_revealed(true);
+            }
+            None => toolchain_banner_write.set_revealed(false),
+        }
+        *pending_packages_write.borrow_mut() = pending;
         pretend_ready_write.set(true);
 
         // If Download Size, Install Method or Build Time was opened
@@ -2197,6 +2219,55 @@ pub fn build(
 
     for url in pkg.homepage.split_whitespace() {
         details.append(&link_row("web-browser-symbolic", "Project Website", url));
+    }
+
+    // Package context beyond the tree itself: a Gentoo wiki page (if one
+    // actually exists — the row stays hidden rather than link to a 404
+    // until MediaWiki's own search API confirms it) and a live Bugzilla
+    // report count. Both fetched once, up front, and cached — cheap
+    // enough (two small API calls) not to need the "Learn More" panel's
+    // click-to-fetch treatment.
+    let wiki_row = adw::ActionRow::builder().title("Gentoo Wiki").subtitle("Checking…").build();
+    wiki_row.add_prefix(&gtk::Image::from_icon_name("accessories-dictionary-symbolic"));
+    wiki_row.set_visible(false);
+    details.append(&wiki_row);
+
+    let bugzilla_row = adw::ActionRow::builder().title("Gentoo Bugzilla").subtitle("Checking…").build();
+    bugzilla_row.add_prefix(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
+    bugzilla_row.set_activatable(true);
+    let bugzilla_url = crate::portage::gentoo_web::bugzilla_search_url(&atom);
+    {
+        let title = "Gentoo Bugzilla".to_string();
+        let url = bugzilla_url.clone();
+        bugzilla_row.connect_activated(move |row| super::webview::open(row, &title, &url));
+    }
+    details.append(&bugzilla_row);
+
+    {
+        let atom_for_context = atom.clone();
+        let display_name_for_context = display_name.clone();
+        let wiki_row = wiki_row.clone();
+        let bugzilla_row = bugzilla_row.clone();
+        runtime::spawn_blocking(
+            move || crate::portage::gentoo_web::lookup(&atom_for_context, &display_name_for_context),
+            move |context| {
+                if let Some(url) = context.wiki_url {
+                    wiki_row.set_subtitle(&url);
+                    wiki_row.set_visible(true);
+                    let title = "Gentoo Wiki".to_string();
+                    wiki_row.set_activatable(true);
+                    let open = gtk::Image::from_icon_name("adw-external-link-symbolic");
+                    wiki_row.add_suffix(&open);
+                    wiki_row.connect_activated(move |row| super::webview::open(row, &title, &url));
+                }
+                bugzilla_row.set_subtitle(&match context.bugzilla_count {
+                    Some(0) => "No reports found".to_string(),
+                    Some(1) => "1 report found".to_string(),
+                    Some(n) => format!("{n} reports found"),
+                    None => "Search Gentoo Bugzilla".to_string(),
+                });
+            },
+        );
     }
 
     // Opens a dedicated reader pulling together whatever documentation

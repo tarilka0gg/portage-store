@@ -2613,10 +2613,76 @@ impl App {
         column.set_size_request(280, -1);
         column.append(&list);
 
+        // Renders the exact commands the queue would actually run —
+        // useful for running something headless over SSH, or just
+        // double-checking what the GUI is about to do before clicking
+        // through a polkit prompt. Only worth offering when there's
+        // something to export.
+        if !self.queue.borrow().is_empty() || !self.flatpak_queue.borrow().is_empty() {
+            let export_button = gtk::Button::with_label("Export Queue as Script…");
+            export_button.add_css_class("flat");
+            export_button.set_margin_top(4);
+            let app_for_export = self.clone();
+            let popover_for_export = popover.clone();
+            export_button.connect_clicked(move |_| {
+                popover_for_export.popdown();
+                app_for_export.export_queue_script();
+            });
+            column.append(&export_button);
+        }
+
         popover.set_child(Some(&column));
         popover.set_parent(anchor);
         popover.connect_closed(|popover| popover.unparent());
         popover.popup();
+    }
+
+    /// Builds a POSIX shell script covering every job currently queued in
+    /// either lane, in run order, and offers it as a save file. Purely a
+    /// snapshot of what's queued *right now* — a job that starts running
+    /// before the save dialog closes isn't un-queued from the script,
+    /// since it genuinely was part of the queue when this was asked for.
+    fn export_queue_script(self: &Rc<Self>) {
+        let mut script = String::from("#!/bin/sh\nset -e\n\n");
+        for entry in self.queue.borrow().iter() {
+            script.push_str(&format!("# {}\n{}\n\n", entry.label, entry.job.to_shell_command()));
+        }
+        for entry in self.flatpak_queue.borrow().iter() {
+            script.push_str(&format!("# {}\n{}\n\n", entry.label, entry.job.to_shell_command()));
+        }
+
+        let file_dialog = gtk::FileDialog::builder().title("Export Queue as Script").initial_name("portage-store-queue.sh").build();
+        let app = self.clone();
+        file_dialog.save(Some(&self.window), gtk::gio::Cancellable::NONE, move |result| {
+            let Ok(file) = result else { return };
+            let Some(path) = file.path() else { return };
+            let script = script.clone();
+            let app = app.clone();
+            runtime::spawn_blocking(
+                move || {
+                    std::fs::write(&path, &script)?;
+                    // Best-effort — a script you can just double-click or
+                    // `./run` beats one that needs a `chmod +x` first,
+                    // but a filesystem that doesn't support the bit
+                    // (e.g. some network mounts) shouldn't fail the
+                    // whole export over it.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(metadata) = std::fs::metadata(&path) {
+                            let mut perms = metadata.permissions();
+                            perms.set_mode(perms.mode() | 0o111);
+                            let _ = std::fs::set_permissions(&path, perms);
+                        }
+                    }
+                    Ok::<(), std::io::Error>(())
+                },
+                move |result| match result {
+                    Ok(()) => app.toast("Queue exported"),
+                    Err(err) => app.toast(&format!("Couldn't export queue: {err}")),
+                },
+            );
+        });
     }
 
     /// Opens a small confirm-and-install dialog for a Flatpak-only search

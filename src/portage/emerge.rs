@@ -23,6 +23,36 @@ pub struct Job {
     pub args: Vec<String>,
 }
 
+impl Job {
+    /// Renders exactly the command line `run` would actually execute —
+    /// the "escape hatch" for anyone who wants to run a queued job
+    /// headless, or just double-check what the GUI is about to do before
+    /// clicking through a polkit prompt. `pkexec` is spelled out
+    /// explicitly here (rather than assumed by the reader) since a
+    /// script meant to be read before running is exactly the place that
+    /// should say so.
+    pub fn to_shell_command(&self) -> String {
+        let mut parts = Vec::new();
+        if self.privileged {
+            parts.push("pkexec".to_string());
+        }
+        parts.push(self.binary.clone());
+        parts.extend(self.args.iter().map(|arg| shell_quote(arg)));
+        parts.join(" ")
+    }
+}
+
+/// Quotes `arg` for a POSIX shell only if it actually needs it — plain
+/// atoms/flags stay bare so a generated script reads like a human wrote
+/// it, rather than every single token wrapped in quotes.
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:@+~".contains(c)) {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
 /// Runs the command described by `job`, pushing its combined stdout/stderr
 /// line by line into `output`. Privileged jobs go through polkit's
 /// `pkexec`, which pops its own native auth dialog — no custom policy file
@@ -255,6 +285,26 @@ pub fn parse_pretend_packages(lines: &[String]) -> Vec<PendingPackage> {
         });
     }
     packages
+}
+
+/// The packages whose own rebuild tends to cascade into rebuilding
+/// everything else on the system (a `gcc`/`glibc` bump commonly triggers
+/// a `@preserved-rebuild` of every package linked against the old
+/// `libstdc++`/libc, on top of the toolchain package's own build time) —
+/// confirmed against this tree's actual atoms rather than assumed, since
+/// Gentoo has moved some of these between categories over the years
+/// (`llvm-core/llvm`, not `sys-devel/llvm`, on a current profile).
+const TOOLCHAIN_ATOMS: &[&str] =
+    &["sys-devel/gcc", "sys-libs/glibc", "sys-devel/binutils", "sys-libs/musl", "llvm-core/llvm", "llvm-core/clang"];
+
+/// Whether this run's package list includes a toolchain component — the
+/// "why is it rebuilding my whole system" surprise a plain package count
+/// doesn't warn about. Checked against the full pending list rather than
+/// only `[ebuild ...]` lines: even a `[binary ...]` toolchain swap is
+/// still the kind of change worth calling out before it happens, not
+/// just a compile-from-source one.
+pub fn touches_toolchain(pending: &[PendingPackage]) -> Option<&'static str> {
+    pending.iter().find_map(|pkg| TOOLCHAIN_ATOMS.iter().find(|&&atom| atom == pkg.atom).copied())
 }
 
 /// Splits a `name-version` token (already stripped of its `category/`
@@ -708,6 +758,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn privileged_jobs_render_with_pkexec_first() {
+        let job = Job { privileged: true, binary: "emerge".to_string(), args: vec!["--ask=n".to_string(), "www-client/firefox".to_string()] };
+        assert_eq!(job.to_shell_command(), "pkexec emerge --ask=n www-client/firefox");
+    }
+
+    #[test]
+    fn unprivileged_jobs_have_no_pkexec_prefix() {
+        let job = Job { privileged: false, binary: "emerge".to_string(), args: vec!["--pretend".to_string(), "www-client/firefox".to_string()] };
+        assert_eq!(job.to_shell_command(), "emerge --pretend www-client/firefox");
+    }
+
+    #[test]
+    fn args_needing_quoting_are_quoted_but_plain_ones_are_not() {
+        let job = Job {
+            privileged: false,
+            binary: "flatpak".to_string(),
+            args: vec!["install".to_string(), "--user".to_string(), "MAKEOPTS=-j4 -l4".to_string()],
+        };
+        assert_eq!(job.to_shell_command(), "flatpak install --user 'MAKEOPTS=-j4 -l4'");
+    }
+
+    #[test]
+    fn a_literal_single_quote_in_an_argument_is_escaped_correctly() {
+        let job = Job { privileged: false, binary: "echo".to_string(), args: vec!["it's here".to_string()] };
+        assert_eq!(job.to_shell_command(), r"echo 'it'\''s here'");
+    }
+
+    #[test]
     fn parses_a_hard_blocker_with_the_quoted_atom_repeated() {
         let lines = vec![
             "[ebuild  N     ] media-video/ffmpeg-6.0::gentoo".to_string(),
@@ -1062,5 +1140,22 @@ mod tests {
         let packages = parse_pretend_packages(&lines);
         assert_eq!(packages[0].atom, "app-editors/neovim");
         assert_eq!(packages[0].version, "9999");
+    }
+
+    #[test]
+    fn a_toolchain_rebuild_is_flagged() {
+        let lines = vec![
+            r#"[ebuild   R    ] app-editors/neovim-0.10.0::gentoo  120 KiB"#.to_string(),
+            r#"[ebuild   R    ] sys-devel/gcc-14.2.1_p20241221::gentoo  95,000 KiB"#.to_string(),
+        ];
+        let packages = parse_pretend_packages(&lines);
+        assert_eq!(touches_toolchain(&packages), Some("sys-devel/gcc"));
+    }
+
+    #[test]
+    fn an_ordinary_update_is_not_flagged_as_a_toolchain_rebuild() {
+        let lines = vec![r#"[ebuild   R    ] app-editors/neovim-0.10.0::gentoo  120 KiB"#.to_string()];
+        let packages = parse_pretend_packages(&lines);
+        assert_eq!(touches_toolchain(&packages), None);
     }
 }
