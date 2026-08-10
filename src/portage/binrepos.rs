@@ -129,10 +129,7 @@ pub fn remove(name: &str) -> Result<()> {
 /// managed file itself) rather than requiring one to already be there.
 fn write_file_ensuring_dir(content: &str) -> Result<()> {
     if !Path::new(BINREPOS_CONF).exists() {
-        let out = std::process::Command::new("pkexec").args(["mkdir", "-p", BINREPOS_CONF]).output().context("failed to launch pkexec")?;
-        if !out.status.success() {
-            anyhow::bail!("failed to create {BINREPOS_CONF}: {}", String::from_utf8_lossy(&out.stderr));
-        }
+        priv_write::mkdir_p_as_root(BINREPOS_CONF)?;
     }
     priv_write::write_file_as_root(managed_path().to_string_lossy().as_ref(), content)
 }

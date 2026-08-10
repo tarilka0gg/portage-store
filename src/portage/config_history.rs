@@ -1,4 +1,4 @@
-use super::priv_write::TRACKED_DIR;
+use super::priv_write::{HELPER_PATH, TRACKED_DIR};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::Command;
@@ -68,10 +68,7 @@ pub fn can_revert() -> bool {
 /// dialog (`make.conf` save, adding a binary repo) rather than routed
 /// through the app's install/update job queue, which this isn't one of.
 pub fn revert_last() -> Result<()> {
-    let output = Command::new("pkexec")
-        .args(["git", "-C", TRACKED_DIR, "revert", "--no-edit", "HEAD"])
-        .output()
-        .context("failed to launch pkexec")?;
+    let output = Command::new("doas").arg(HELPER_PATH).arg("git-revert").output().context("failed to launch doas")?;
     if !output.status.success() {
         bail!("git revert failed: {}", String::from_utf8_lossy(&output.stderr));
     }

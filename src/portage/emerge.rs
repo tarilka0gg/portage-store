@@ -1,3 +1,4 @@
+use super::priv_write::HELPER_PATH;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -9,37 +10,65 @@ pub enum EmergeEvent {
     FailedToStart(String),
 }
 
-/// One job invocation: which binary fronts it (root via `pkexec`, or the
-/// current user for read-only `--pretend` runs) and its argv. `binary` is
-/// almost always `emerge` — the exception is `sandbox::build_job`, which
-/// reuses this exact same queue/streaming/progress-bar machinery to run a
-/// privileged setup-and-chroot-build shell script instead, rather than
-/// duplicating all of it for one more kind of long-running privileged
-/// command.
+/// One job invocation: which binary fronts it (root via the `priv-helper`
+/// `run` subcommand, or the current user for read-only `--pretend` runs)
+/// and its argv. `binary` is almost always `emerge` — the exception is
+/// `sandbox::build_job`, which sets it to the synthetic name
+/// `"sandbox-build"`, dispatched by the helper to the installed
+/// `sandbox-build.sh` instead of through its `emerge`-only binary
+/// allowlist; this queue/streaming/progress-bar machinery is otherwise
+/// identical either way, rather than duplicating all of it for one more
+/// kind of long-running privileged command.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Job {
     pub privileged: bool,
     pub binary: String,
     pub args: Vec<String>,
+    /// Set by `resource_limits::throttled` — a validated job count the
+    /// helper itself turns into a fixed `ionice/nice/env MAKEOPTS=...`
+    /// wrap, built from scratch on the privileged side rather than
+    /// assembled here and passed through as argv (which a passwordless
+    /// rule can't afford to trust blindly). Ignored for unprivileged jobs.
+    pub jobs_override: Option<u32>,
 }
 
 impl Job {
     /// Renders exactly the command line `run` would actually execute —
     /// the "escape hatch" for anyone who wants to run a queued job
-    /// headless, or just double-check what the GUI is about to do before
-    /// clicking through a polkit prompt. `pkexec` is spelled out
-    /// explicitly here (rather than assumed by the reader) since a
-    /// script meant to be read before running is exactly the place that
-    /// should say so.
+    /// headless, or just double-check what the GUI is about to do. The
+    /// `doas priv-helper run` prefix is spelled out explicitly here
+    /// (rather than assumed by the reader) since a script meant to be
+    /// read before running is exactly the place that should say so.
     pub fn to_shell_command(&self) -> String {
         let mut parts = Vec::new();
         if self.privileged {
-            parts.push("pkexec".to_string());
+            parts.push("doas".to_string());
+            parts.push(HELPER_PATH.to_string());
+            if is_synthetic_subcommand(&self.binary) {
+                parts.push(self.binary.clone());
+                parts.extend(self.args.iter().map(|arg| shell_quote(arg)));
+                return parts.join(" ");
+            }
+            parts.push("run".to_string());
+            if let Some(jobs) = self.jobs_override {
+                parts.push("--jobs".to_string());
+                parts.push(jobs.to_string());
+            }
+            parts.push("--".to_string());
         }
         parts.push(self.binary.clone());
         parts.extend(self.args.iter().map(|arg| shell_quote(arg)));
         parts.join(" ")
     }
+}
+
+/// A `Job::binary` that names a helper subcommand directly (dispatched
+/// outside `cmd_run`'s binary allowlist) rather than a real executable on
+/// `$PATH` — see `resources/priv-helper.sh`'s `sandbox-build` and
+/// `enable-overlay` cases, each of which takes its own validated argument
+/// shape instead of arbitrary trailing argv.
+fn is_synthetic_subcommand(binary: &str) -> bool {
+    matches!(binary, "sandbox-build" | "enable-overlay")
 }
 
 /// Quotes `arg` for a POSIX shell only if it actually needs it — plain
@@ -54,16 +83,26 @@ fn shell_quote(arg: &str) -> String {
 }
 
 /// Runs the command described by `job`, pushing its combined stdout/stderr
-/// line by line into `output`. Privileged jobs go through polkit's
-/// `pkexec`, which pops its own native auth dialog — no custom policy file
-/// needed for a single admin-authenticated action.
+/// line by line into `output`. Privileged jobs go through the passwordless
+/// `doas priv-helper run` path (see `priv_write::HELPER_PATH`) — no prompt
+/// of any kind, by design; see `resources/priv-helper.sh` for the binary
+/// allowlist and validation that stands in for it.
 ///
 /// The channel is an `async_channel` one so the GTK side can await it
 /// directly on the main context and update widgets as output arrives.
 pub async fn run(job: Job, output: async_channel::Sender<EmergeEvent>) {
     let mut command = if job.privileged {
-        let mut c = Command::new("pkexec");
-        c.arg(&job.binary);
+        let mut c = Command::new("doas");
+        c.arg(HELPER_PATH);
+        if is_synthetic_subcommand(&job.binary) {
+            c.arg(&job.binary);
+        } else {
+            c.arg("run");
+            if let Some(jobs) = job.jobs_override {
+                c.arg("--jobs").arg(jobs.to_string());
+            }
+            c.arg("--").arg(&job.binary);
+        }
         c
     } else {
         Command::new(&job.binary)
@@ -126,7 +165,7 @@ pub fn install_job(atom: &str, getbinpkg: bool) -> Job {
     let mut args = vec!["--ask=n".into(), "--verbose".into()];
     args.extend(binpkg_args(getbinpkg));
     args.push(atom.into());
-    Job { privileged: true, binary: "emerge".into(), args }
+    Job { privileged: true, binary: "emerge".into(), args, jobs_override: None }
 }
 
 /// Installs/updates several atoms in one run — used for applying an
@@ -137,7 +176,7 @@ pub fn install_many_job(atoms: &[String], getbinpkg: bool) -> Job {
     let mut args = vec!["--ask=n".into(), "--verbose".into()];
     args.extend(binpkg_args(getbinpkg));
     args.extend(atoms.iter().cloned());
-    Job { privileged: true, binary: "emerge".into(), args }
+    Job { privileged: true, binary: "emerge".into(), args, jobs_override: None }
 }
 
 /// Dry-run of an install, used to show the user what would happen (download
@@ -147,7 +186,7 @@ pub fn pretend_install_job(atom: &str, getbinpkg: bool) -> Job {
     let mut args = vec!["--pretend".into(), "--verbose".into()];
     args.extend(binpkg_args(getbinpkg));
     args.push(atom.into());
-    Job { privileged: false, binary: "emerge".into(), args }
+    Job { privileged: false, binary: "emerge".into(), args, jobs_override: None }
 }
 
 /// In-memory cache of a `--pretend` run's raw output lines (plus whether it
@@ -708,19 +747,19 @@ pub fn parse_build_failure(lines: &[String]) -> Option<BuildFailure> {
 
 /// Reads a build log at `path` — `PORTAGE_TMPDIR` (`/var/tmp/portage` by
 /// default) is `portage:portage`-owned and not world-readable, so a plain
-/// read fails for a user who isn't in that group. Falls back to `pkexec
-/// cat` (the install/uninstall job that just failed already needed root,
-/// so this follow-up read is rarely a fresh polkit prompt in practice —
-/// most policies cache a recent authorization for a short window) rather
-/// than silently giving up and showing nothing.
+/// read fails for a user who isn't in that group. Falls back to
+/// `doas priv-helper cat-log` (scoped by the helper to `/var/tmp/portage`)
+/// rather than silently giving up and showing nothing.
 pub fn read_build_log(path: &str) -> Result<String, String> {
     if let Ok(text) = std::fs::read_to_string(path) {
         return Ok(text);
     }
-    let output = std::process::Command::new("pkexec")
-        .args(["cat", path])
+    let output = std::process::Command::new("doas")
+        .arg(HELPER_PATH)
+        .arg("cat-log")
+        .arg(path)
         .output()
-        .map_err(|e| format!("failed to launch pkexec: {e}"))?;
+        .map_err(|e| format!("failed to launch doas: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
@@ -733,6 +772,7 @@ pub fn uninstall_job(atom: &str) -> Job {
         privileged: true,
         binary: "emerge".into(),
         args: vec!["--ask=n".into(), "--depclean".into(), atom.into()],
+        jobs_override: None,
     }
 }
 
@@ -747,7 +787,7 @@ pub fn update_world_job(getbinpkg: bool) -> Job {
     let mut args = vec!["--ask=n".into(), "--update".into(), "--deep".into(), "--newuse".into(), "--keep-going".into()];
     args.extend(binpkg_args(getbinpkg));
     args.push("@world".into());
-    Job { privileged: true, binary: "emerge".into(), args }
+    Job { privileged: true, binary: "emerge".into(), args, jobs_override: None }
 }
 
 /// Dry-run `@world` update, used to compute the pending-updates list. Runs
@@ -756,7 +796,7 @@ pub fn pretend_world_job(getbinpkg: bool) -> Job {
     let mut args = vec!["--pretend".into(), "--update".into(), "--deep".into(), "--newuse".into()];
     args.extend(binpkg_args(getbinpkg));
     args.push("@world".into());
-    Job { privileged: false, binary: "emerge".into(), args }
+    Job { privileged: false, binary: "emerge".into(), args, jobs_override: None }
 }
 
 /// Whether the package ships an already-compiled binary rather than sources.
@@ -820,14 +860,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn privileged_jobs_render_with_pkexec_first() {
-        let job = Job { privileged: true, binary: "emerge".to_string(), args: vec!["--ask=n".to_string(), "www-client/firefox".to_string()] };
-        assert_eq!(job.to_shell_command(), "pkexec emerge --ask=n www-client/firefox");
+    fn privileged_jobs_render_with_doas_priv_helper_run_first() {
+        let job = Job {
+            privileged: true,
+            binary: "emerge".to_string(),
+            args: vec!["--ask=n".to_string(), "www-client/firefox".to_string()],
+            jobs_override: None,
+        };
+        assert_eq!(job.to_shell_command(), format!("doas {HELPER_PATH} run -- emerge --ask=n www-client/firefox"));
     }
 
     #[test]
-    fn unprivileged_jobs_have_no_pkexec_prefix() {
-        let job = Job { privileged: false, binary: "emerge".to_string(), args: vec!["--pretend".to_string(), "www-client/firefox".to_string()] };
+    fn a_jobs_override_renders_as_a_run_flag() {
+        let job = Job { privileged: true, binary: "emerge".to_string(), args: vec!["@world".to_string()], jobs_override: Some(4) };
+        assert_eq!(job.to_shell_command(), format!("doas {HELPER_PATH} run --jobs 4 -- emerge @world"));
+    }
+
+    #[test]
+    fn sandbox_build_jobs_render_with_their_own_subcommand() {
+        let job = Job { privileged: true, binary: "sandbox-build".to_string(), args: vec!["dev-libs/foo".to_string()], jobs_override: None };
+        assert_eq!(job.to_shell_command(), format!("doas {HELPER_PATH} sandbox-build dev-libs/foo"));
+    }
+
+    #[test]
+    fn unprivileged_jobs_have_no_doas_prefix() {
+        let job = Job {
+            privileged: false,
+            binary: "emerge".to_string(),
+            args: vec!["--pretend".to_string(), "www-client/firefox".to_string()],
+            jobs_override: None,
+        };
         assert_eq!(job.to_shell_command(), "emerge --pretend www-client/firefox");
     }
 
@@ -837,13 +899,14 @@ mod tests {
             privileged: false,
             binary: "flatpak".to_string(),
             args: vec!["install".to_string(), "--user".to_string(), "MAKEOPTS=-j4 -l4".to_string()],
+            jobs_override: None,
         };
         assert_eq!(job.to_shell_command(), "flatpak install --user 'MAKEOPTS=-j4 -l4'");
     }
 
     #[test]
     fn a_literal_single_quote_in_an_argument_is_escaped_correctly() {
-        let job = Job { privileged: false, binary: "echo".to_string(), args: vec!["it's here".to_string()] };
+        let job = Job { privileged: false, binary: "echo".to_string(), args: vec!["it's here".to_string()], jobs_override: None };
         assert_eq!(job.to_shell_command(), r"echo 'it'\''s here'");
     }
 

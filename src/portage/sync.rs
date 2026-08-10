@@ -48,7 +48,7 @@ pub fn format_age(seconds: u64) -> String {
 /// Syncs the package tree. Privileged — writing the tree is a root
 /// operation the same way installing a package is.
 pub fn sync_job() -> Job {
-    Job { privileged: true, binary: "emerge".into(), args: vec!["--sync".into()] }
+    Job { privileged: true, binary: "emerge".into(), args: vec!["--sync".into()], jobs_override: None }
 }
 
 #[cfg(test)]

@@ -32,31 +32,19 @@ pub fn recommended_jobs() -> u32 {
     cores.min(ram_limit).max(1)
 }
 
-/// Wraps `job` to run at reduced CPU/IO scheduling priority (`nice`/
-/// `ionice`, idle class — keeps a build from starving whatever else is
-/// running) and with `MAKEOPTS` capped to `recommended_jobs()`.
+/// Marks `job` to run at reduced CPU/IO scheduling priority with `MAKEOPTS`
+/// capped to `recommended_jobs()`, by setting `jobs_override` rather than
+/// rewriting `binary`/`args` into an `ionice`/`nice`/`env` chain here.
 ///
-/// The `MAKEOPTS` override is threaded through via an explicit `env`
-/// prefix baked into the command's own argv, not a `Command::env()` call
-/// on the Rust side — `pkexec` sanitizes the environment of whatever it
-/// launches, so a variable set only on the local `Command` object would
-/// simply never reach the actual `emerge` process for a privileged job.
-/// Putting it in argv via `env VAR=value` has no such problem, since it's
-/// explicit input to the command chain rather than inherited state.
+/// That rewrite is what the old `pkexec`-based design did, but it can't
+/// survive translation into a small, auditable binary allowlist on the
+/// privileged side (the allowlist would have to permit `ionice` with any
+/// trailing argv, defeating the point of having one at all). Instead the
+/// helper itself (`resources/priv-helper.sh`'s `cmd_run`) builds the fixed
+/// `ionice -c3 nice -n19 env MAKEOPTS=...` wrap from this validated
+/// integer — never from argv this binary supplied.
 pub fn throttled(job: Job) -> Job {
-    let jobs = recommended_jobs();
-    let mut args = vec![
-        "-c".to_string(),
-        "3".to_string(), // ionice: idle I/O class
-        "nice".to_string(),
-        "-n".to_string(),
-        "19".to_string(), // lowest CPU scheduling priority
-        "env".to_string(),
-        format!("MAKEOPTS=-j{jobs} -l{jobs}"),
-        job.binary,
-    ];
-    args.extend(job.args);
-    Job { privileged: job.privileged, binary: "ionice".to_string(), args }
+    Job { jobs_override: Some(recommended_jobs()), ..job }
 }
 
 #[cfg(test)]
@@ -64,16 +52,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn throttled_wraps_the_original_command_unchanged_at_the_tail() {
-        let job = Job { privileged: true, binary: "emerge".to_string(), args: vec!["--ask=n".to_string(), "www-client/firefox".to_string()] };
+    fn throttled_sets_jobs_override_and_leaves_binary_args_untouched() {
+        let job = Job {
+            privileged: true,
+            binary: "emerge".to_string(),
+            args: vec!["--ask=n".to_string(), "www-client/firefox".to_string()],
+            jobs_override: None,
+        };
         let wrapped = throttled(job);
         assert!(wrapped.privileged);
-        assert_eq!(wrapped.binary, "ionice");
-        // The original binary+args must still appear, in order, at the
-        // tail of the wrapped argv — that's what actually gets run once
-        // ionice/nice/env are done setting up.
-        let tail = &wrapped.args[wrapped.args.len() - 3..];
-        assert_eq!(tail, &["emerge".to_string(), "--ask=n".to_string(), "www-client/firefox".to_string()]);
+        assert_eq!(wrapped.binary, "emerge");
+        assert_eq!(wrapped.args, vec!["--ask=n".to_string(), "www-client/firefox".to_string()]);
+        assert!(wrapped.jobs_override.unwrap() >= 1);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use super::emerge::Job;
 /// operation in Gentoo if run carelessly, which is exactly why this gets
 /// a dedicated review flow instead of firing straight from a button.
 pub fn pretend_job() -> Job {
-    Job { privileged: false, binary: "emerge".into(), args: vec!["--pretend".into(), "--depclean".into()] }
+    Job { privileged: false, binary: "emerge".into(), args: vec!["--pretend".into(), "--depclean".into()], jobs_override: None }
 }
 
 /// The real sweep. `protect` atoms are excluded from *this run* via
@@ -22,7 +22,7 @@ pub fn depclean_job(protect: &[String]) -> Job {
         args.push("--exclude".into());
         args.push(atom.clone());
     }
-    Job { privileged: true, binary: "emerge".into(), args }
+    Job { privileged: true, binary: "emerge".into(), args, jobs_override: None }
 }
 
 /// Adds `atom` to `@world` without changing what's installed — the
@@ -30,7 +30,7 @@ pub fn depclean_job(protect: &[String]) -> Job {
 /// `--noreplace` is what makes this a no-op on an already-installed
 /// package rather than a reinstall.
 pub fn noreplace_job(atom: &str) -> Job {
-    Job { privileged: true, binary: "emerge".into(), args: vec!["--noreplace".into(), atom.into()] }
+    Job { privileged: true, binary: "emerge".into(), args: vec!["--noreplace".into(), atom.into()], jobs_override: None }
 }
 
 /// Whether depclean's own dependency resolution failed outright — it

@@ -15,35 +15,46 @@ use std::process::{Command, Stdio};
 /// own the way it owns its own managed files there.
 pub const TRACKED_DIR: &str = "/etc/portage";
 
+/// Every privileged operation in this app goes through this one
+/// root-owned script (see `resources/priv-helper.sh` in the repo for the
+/// reviewable source; installed by hand to this path, not by the app
+/// itself) via a passwordless `doas` rule scoped to exactly this command
+/// (see `/etc/doas.conf`). Unlike the `pkexec bash -c "<script text>"`
+/// pattern this replaced, script *content* never travels through the
+/// privileged call as an argument — only a subcommand name and validated
+/// paths do. The helper owns all the actual logic (git tracking, path
+/// scoping, the `emerge`/sandbox-build binary allowlist) and is the only
+/// thing a passwordless rule needs to trust, rather than trusting every
+/// caller in this binary to never mishandle a script string.
+pub const HELPER_PATH: &str = "/usr/local/libexec/portage-store/priv-helper";
+
 /// Writes `content` to `path` as root. When `path` falls under
-/// `TRACKED_DIR`, the write is wrapped in a git commit (initializing a
-/// repo there — with a baseline snapshot of whatever already existed —
-/// on the very first write this app ever makes) rather than a plain
-/// `pkexec tee`; a write outside that directory (there currently are
-/// none, but nothing enforces it) just writes the file.
+/// `TRACKED_DIR`, the helper wraps the write in a git commit
+/// (initializing a repo there — with a baseline snapshot of whatever
+/// already existed — on the very first write this app ever makes)
+/// rather than a plain write; a write outside that directory is rejected
+/// by the helper itself (`write-tracked` is scoped to `TRACKED_DIR`).
 pub fn write_file_as_root(path: &str, content: &str) -> Result<()> {
     let message = default_commit_message(path);
-    let mut child = Command::new("pkexec")
-        .arg("bash")
-        .arg("-c")
-        .arg(WRITE_SCRIPT)
-        .arg("bash") // $0 — conventionally the script's own name, unused here
+    let mut child = Command::new("doas")
+        .arg(HELPER_PATH)
+        .arg("write-tracked")
         .arg(path)
         .arg(&message)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to launch pkexec")?;
+        .context("failed to launch doas")?;
 
     child
         .stdin
         .take()
         .expect("piped stdin")
         .write_all(content.as_bytes())
-        .context("failed to write to pkexec stdin")?;
+        .context("failed to write to doas stdin")?;
 
-    let out = child.wait_with_output().context("pkexec did not exit cleanly")?;
+    let out = child.wait_with_output().context("doas did not exit cleanly")?;
     if !out.status.success() {
         bail!(
             "failed to write {path} as root: {}",
@@ -52,47 +63,6 @@ pub fn write_file_as_root(path: &str, content: &str) -> Result<()> {
     }
     Ok(())
 }
-
-/// `$1` is the target path, `$2` the git commit message to use if the
-/// target falls under `TRACKED_DIR`.
-///
-/// The baseline-snapshot init deliberately runs *before* `cat > "$TARGET"`
-/// writes anything — staging and committing "whatever's already there"
-/// only captures pre-existing state if it runs before this write adds
-/// anything new to capture. Doing it the other way around (write first,
-/// init after) was tried and is wrong: the brand new file would already
-/// exist on disk by the time the baseline commit's `git add -A` runs, so
-/// the "baseline" would silently absorb this write's own content instead
-/// of representing only what came before it, leaving nothing left to
-/// commit as *this* write's own change.
-const WRITE_SCRIPT: &str = r#"set -euo pipefail
-TARGET="$1"
-MESSAGE="$2"
-REPO_DIR="/etc/portage"
-
-case "$TARGET" in
-  "$REPO_DIR"/*)
-    if [ ! -d "$REPO_DIR/.git" ]; then
-        git -C "$REPO_DIR" init -q
-        git -C "$REPO_DIR" config user.name "Portage Store"
-        git -C "$REPO_DIR" config user.email "portage-store@localhost"
-        git -C "$REPO_DIR" add -A
-        git -C "$REPO_DIR" commit -q -m "Baseline snapshot" --allow-empty
-    fi
-    ;;
-esac
-
-cat > "$TARGET"
-
-case "$TARGET" in
-  "$REPO_DIR"/*)
-    git -C "$REPO_DIR" add -A
-    if ! git -C "$REPO_DIR" diff --cached --quiet; then
-        git -C "$REPO_DIR" commit -q -m "$MESSAGE"
-    fi
-    ;;
-esac
-"#;
 
 /// A reasonable default commit message derived from the path alone
 /// (`/etc/portage/package.use/zz-portage-store` -> "Update
@@ -105,34 +75,31 @@ fn default_commit_message(path: &str) -> String {
 }
 
 /// Writes `content` to `live_path` as root, then removes `discard_path` —
-/// one privileged operation instead of two separate `pkexec` calls, so
-/// resolving a pending config update (write the accepted/merged content,
-/// clear the `._cfgNNNN_name` file that prompted it) needs only one
-/// polkit prompt. Paths are passed as `bash` positional arguments rather
-/// than interpolated into the script source, so nothing about either path
-/// needs shell-escaping.
+/// one privileged operation instead of two separate calls, so resolving a
+/// pending config update (write the accepted/merged content, clear the
+/// `._cfgNNNN_name` file that prompted it) needs only one call into the
+/// helper. Both paths are validated by the helper to be under `/etc` and
+/// `discard_path` to actually look like a `._cfgNNNN_name` file.
 pub fn write_then_remove_as_root(live_path: &Path, content: &str, discard_path: &Path) -> Result<()> {
-    let mut child = Command::new("pkexec")
-        .arg("bash")
-        .arg("-c")
-        .arg(r#"cat > "$1" && rm -f "$2""#)
-        .arg("bash") // $0 — conventionally the script's own name, unused here
+    let mut child = Command::new("doas")
+        .arg(HELPER_PATH)
+        .arg("write-then-remove")
         .arg(live_path)
         .arg(discard_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to launch pkexec")?;
+        .context("failed to launch doas")?;
 
     child
         .stdin
         .take()
         .expect("piped stdin")
         .write_all(content.as_bytes())
-        .context("failed to write to pkexec stdin")?;
+        .context("failed to write to doas stdin")?;
 
-    let out = child.wait_with_output().context("pkexec did not exit cleanly")?;
+    let out = child.wait_with_output().context("doas did not exit cleanly")?;
     if !out.status.success() {
         bail!("failed to update {}: {}", live_path.display(), String::from_utf8_lossy(&out.stderr));
     }
@@ -140,53 +107,52 @@ pub fn write_then_remove_as_root(live_path: &Path, content: &str, discard_path: 
 }
 
 /// Removes `path` as root — used to discard a pending config update
-/// (`._cfgNNNN_name`) while leaving the current live file untouched.
+/// (`._cfgNNNN_name`) while leaving the current live file untouched, and
+/// to delete an env override file. Validated by the helper to be under
+/// `/etc`.
 pub fn remove_file_as_root(path: &Path) -> Result<()> {
-    let out =
-        Command::new("pkexec").args(["rm", "-f"]).arg(path).output().context("failed to launch pkexec")?;
+    let out = Command::new("doas")
+        .arg(HELPER_PATH)
+        .arg("remove-file")
+        .arg(path)
+        .output()
+        .context("failed to launch doas")?;
     if !out.status.success() {
         bail!("failed to remove {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
     }
     Ok(())
 }
 
+/// Creates `dir` (and any missing parents) as root — used when a
+/// `package.*`-style directory (e.g. `binrepos.conf`) doesn't exist yet
+/// on a system that's never had one configured. Validated by the helper
+/// to be under `/etc/portage`.
+pub fn mkdir_p_as_root(dir: &str) -> Result<()> {
+    let out = Command::new("doas").arg(HELPER_PATH).arg("mkdir-p").arg(dir).output().context("failed to launch doas")?;
+    if !out.status.success() {
+        bail!("failed to create {dir}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(())
+}
+
 /// Applies `pairs` (each a `(live_path, proposed_path)`, in the shape
 /// `write_then_remove_as_root` already handles one at a time) as a
-/// *single* privileged operation — one `pkexec` call, one polkit
-/// authentication, for however many files there are. Calling
-/// `write_then_remove_as_root` once per file for a bulk "accept
-/// everything" action means one polkit prompt *per file*, back to back —
-/// which reads as broken (the first prompt appears, then nothing
-/// visibly happens for the rest) rather than as N legitimate requests.
-/// Paths are passed as positional arguments to the script, not
-/// interpolated into its source, so nothing about any of them needs
-/// shell-escaping.
+/// *single* privileged operation — one `doas` call for however many
+/// files there are. Calling `write_then_remove_as_root` once per file for
+/// a bulk "accept everything" action would mean N separate privileged
+/// calls in a row for no reason once batching is this cheap.
 pub fn write_then_remove_many_as_root(pairs: &[(&Path, &Path)]) -> Result<()> {
     if pairs.is_empty() {
         return Ok(());
     }
-    let mut command = Command::new("pkexec");
-    command.arg("bash").arg("-c").arg(BULK_WRITE_THEN_REMOVE_SCRIPT).arg("bash");
+    let mut command = Command::new("doas");
+    command.arg(HELPER_PATH).arg("write-then-remove-many").arg("--");
     for (live_path, proposed_path) in pairs {
         command.arg(live_path).arg(proposed_path);
     }
-    let out = command.output().context("failed to launch pkexec")?;
+    let out = command.output().context("failed to launch doas")?;
     if !out.status.success() {
         bail!("failed to apply {} update(s): {}", pairs.len(), String::from_utf8_lossy(&out.stderr));
     }
     Ok(())
 }
-
-/// `$@` is `live_path proposed_path` pairs, flattened — `cp` (not a
-/// stdin pipe, since there's no single content stream for N files) the
-/// proposed content onto the live file, then remove the now-applied
-/// `._cfgNNNN_` file, once per pair.
-const BULK_WRITE_THEN_REMOVE_SCRIPT: &str = r#"set -euo pipefail
-while [ "$#" -ge 2 ]; do
-    live="$1"
-    proposed="$2"
-    shift 2
-    cp -- "$proposed" "$live"
-    rm -f -- "$proposed"
-done
-"#;

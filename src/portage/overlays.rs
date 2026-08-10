@@ -81,27 +81,28 @@ pub fn list() -> Result<Vec<Overlay>> {
 
 /// Enables `name` — privileged, since it writes to `/etc/portage/repos.conf`.
 /// Only makes the repo *known*; its packages aren't actually fetchable
-/// until it's synced (folded into the same job via `&&`, one polkit
-/// prompt instead of two, since enabling an overlay with nothing synced
-/// yet isn't useful on its own).
+/// until it's synced, folded into the same job so the queue shows one
+/// step instead of two for what's really one logical action.
+///
+/// `binary` is the synthetic name `"enable-overlay"`, dispatched by the
+/// helper (`resources/priv-helper.sh`'s `cmd_enable_overlay`) to its own
+/// fixed `eselect repository enable -- "$1" && emerge --sync --repo "$1"`
+/// sequence, built from a validated repo name rather than passed through
+/// as `bash -c` script text — the same reasoning as `sandbox::build_job`.
 pub fn enable_and_sync_job(name: &str) -> Job {
-    Job {
-        privileged: true,
-        binary: "bash".into(),
-        args: vec![
-            "-c".into(),
-            "eselect repository enable -- \"$1\" && emerge --sync --repo \"$1\"".into(),
-            "bash".into(),
-            name.into(),
-        ],
-    }
+    Job { privileged: true, binary: "enable-overlay".into(), args: vec![name.into()], jobs_override: None }
 }
 
 /// Disables `name` — the repo's own local copy is left in place (matching
 /// `eselect repository disable`'s own default, not `-f`/force removal),
 /// so re-enabling it later doesn't need a fresh sync.
 pub fn disable_job(name: &str) -> Job {
-    Job { privileged: true, binary: "eselect".into(), args: vec!["repository".into(), "disable".into(), name.into()] }
+    Job {
+        privileged: true,
+        binary: "eselect".into(),
+        args: vec!["repository".into(), "disable".into(), name.into()],
+        jobs_override: None,
+    }
 }
 
 #[cfg(test)]

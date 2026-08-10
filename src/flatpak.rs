@@ -185,7 +185,12 @@ const SCOPE: &str = "--user";
 use crate::portage::emerge::Job;
 
 pub fn install_job(remote: &str, app_id: &str) -> Job {
-    Job { privileged: false, binary: "flatpak".into(), args: vec!["install".into(), SCOPE.into(), "-y".into(), remote.into(), app_id.into()] }
+    Job {
+        privileged: false,
+        binary: "flatpak".into(),
+        args: vec!["install".into(), SCOPE.into(), "-y".into(), remote.into(), app_id.into()],
+        jobs_override: None,
+    }
 }
 
 /// Adds Flathub as a `--user` remote if it isn't already one — the

@@ -96,6 +96,7 @@ pub fn clean_job(target: Target) -> super::emerge::Job {
         privileged: true,
         binary: target.binary().into(),
         args: vec!["--deep".into(), "--nocolor".into()],
+        jobs_override: None,
     }
 }
 

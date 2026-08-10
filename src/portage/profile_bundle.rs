@@ -24,7 +24,7 @@ pub fn export(dest: &Path) -> Result<()> {
     let atoms = super::world::read().context("failed to read @world")?;
 
     let staging = unique_temp_dir("portage-store-export");
-    std::fs::create_dir_all(&staging).context("failed to create a staging directory")?;
+    create_scratch_dir(&staging)?;
     let result = (|| -> Result<()> {
         std::fs::write(staging.join(WORLD_ENTRY), atoms.join("\n"))
             .context("failed to write the staged world file")?;
@@ -71,7 +71,7 @@ impl Drop for ExtractedBundle {
 /// `import` actually does it.
 pub fn extract(bundle: &Path) -> Result<ExtractedBundle> {
     let dir = unique_temp_dir("portage-store-import");
-    std::fs::create_dir_all(&dir).context("failed to create a scratch directory")?;
+    create_scratch_dir(&dir)?;
 
     let status = Command::new("tar")
         .arg("xzf")
@@ -113,13 +113,12 @@ pub fn extract(bundle: &Path) -> Result<ExtractedBundle> {
 /// belongs in the app's normal job queue, not blocking on this call.
 pub fn import(bundle: &ExtractedBundle) -> Result<()> {
     let source = bundle.dir.join(CONFIG_ENTRY);
-    let status = Command::new("pkexec")
-        .arg("cp")
-        .arg("-a")
-        .arg(format!("{}/.", source.display()))
-        .arg("/etc/portage/")
+    let status = Command::new("doas")
+        .arg(super::priv_write::HELPER_PATH)
+        .arg("cp-bundle")
+        .arg(&source)
         .status()
-        .context("failed to launch pkexec")?;
+        .context("failed to launch doas")?;
     if !status.success() {
         bail!("failed to copy the bundled configuration into /etc/portage");
     }
@@ -215,12 +214,36 @@ pub fn diff(bundle: &ExtractedBundle) -> Result<BundleDiff> {
     Ok(BundleDiff { atoms_only_in_bundle, atoms_only_here, use_flag_differences })
 }
 
+/// Prefers `$XDG_RUNTIME_DIR` (already per-user, `0700`, tmpfs-backed —
+/// set up by the session manager, not this app) over the shared,
+/// world-writable `/tmp` that `std::env::temp_dir()` would otherwise
+/// return. This matters specifically because `import`'s `cp-bundle` step
+/// reads back out of whatever this function returns: `/tmp` being
+/// world-writable means another local user could race to predict/plant
+/// something at this path before the privileged copy runs, which a
+/// private runtime directory doesn't allow in the first place.
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    std::env::temp_dir().join(format!("{prefix}-{unique}"))
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    base.join(format!("{prefix}-{unique}"))
+}
+
+/// `create_dir_all`, but `0700` — belt-and-suspenders alongside
+/// `unique_temp_dir` preferring a private runtime directory: even if a
+/// system lacks `XDG_RUNTIME_DIR` and this falls back to shared `/tmp`,
+/// the directory itself still isn't readable/writable by anyone else.
+fn create_scratch_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to restrict permissions on {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
