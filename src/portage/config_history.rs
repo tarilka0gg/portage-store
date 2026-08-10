@@ -60,17 +60,45 @@ pub fn can_revert() -> bool {
     history(2).map(|commits| commits.len() > 1).unwrap_or(false)
 }
 
-/// Reverts the most recent commit — as its own new commit (`git revert`,
-/// not a history rewrite), so the fact that a revert happened is itself
-/// part of the same permanent record everything else here is for.
-/// Privileged (writes to `/etc/portage`); blocking, matching the other
-/// privileged actions already called directly from the preferences
-/// dialog (`make.conf` save, adding a binary repo) rather than routed
-/// through the app's install/update job queue, which this isn't one of.
-pub fn revert_last() -> Result<()> {
-    let output = Command::new("doas").arg(HELPER_PATH).arg("git-revert").output().context("failed to launch doas")?;
+/// Reverts `target` (a commit hash, or `"HEAD"` for the most recent
+/// change) — as its own new commit (`git revert`, not a history
+/// rewrite), so the fact that a revert happened is itself part of the
+/// same permanent record everything else here is for. Privileged (writes
+/// to `/etc/portage`); blocking, matching the other privileged actions
+/// already called directly from the preferences dialog (`make.conf`
+/// save, adding a binary repo) rather than routed through the app's
+/// install/update job queue, which this isn't one of.
+pub fn revert(target: &str) -> Result<()> {
+    let output =
+        Command::new("doas").arg(HELPER_PATH).arg("git-revert").arg(target).output().context("failed to launch doas")?;
     if !output.status.success() {
         bail!("git revert failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(())
+}
+
+/// The full patch for one commit — `git show`, read-only, no privilege
+/// needed (same reasoning as `history`: `/etc/portage` stays
+/// world-readable).
+pub fn diff(hash: &str) -> Result<String> {
+    git(&["show", hash])
+}
+
+/// Tags the current `HEAD` with a name derived from `label`, before a
+/// big operation (an `@world` update) actually starts — a known-good
+/// point the history browser can jump back to later, distinct from an
+/// ordinary revert (which only undoes the single most recent commit).
+/// Force-moves the tag if one with this exact generated name somehow
+/// already exists (same run started twice in the same second), matching
+/// `git tag -f`'s normal semantics. Best-effort by design: callers
+/// should never let a tagging failure block the actual operation it was
+/// meant to bookmark.
+pub fn tag_before(label: &str) -> Result<()> {
+    let unix_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let name = format!("pre-{label}-{unix_time}");
+    let output = Command::new("doas").arg(HELPER_PATH).arg("git-tag").arg(&name).output().context("failed to launch doas")?;
+    if !output.status.success() {
+        bail!("git tag failed: {}", String::from_utf8_lossy(&output.stderr));
     }
     Ok(())
 }

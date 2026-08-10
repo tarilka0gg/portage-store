@@ -1,5 +1,5 @@
 use super::{App, QueueEntry};
-use crate::portage::eclean::{self, Target};
+use portage_store::portage::eclean::{self, Target};
 use crate::ui::runtime;
 use adw::prelude::*;
 use std::rc::Rc;
@@ -43,7 +43,7 @@ fn target_row(app: &Rc<App>, target: Target) -> adw::ActionRow {
                     row.set_subtitle(&format!(
                         "{} files · {} reclaimable",
                         preview.file_count,
-                        crate::portage::emerge::format_size_kib(preview.total_kib)
+                        portage_store::portage::emerge::format_size_kib(preview.total_kib)
                     ));
                     clean_button.set_sensitive(true);
                 }

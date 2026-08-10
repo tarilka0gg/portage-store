@@ -45,9 +45,19 @@ pub struct CleanupPreview {
 /// installed everything it downloaded — the non-deep default only clears
 /// files for ebuilds no longer in the tree whatsoever, which is a much
 /// smaller and rarer category.
+///
+/// `-n`/`--package-names` ("protect all versions [of installed packages]
+/// when --deep") is what keeps this from being actively hostile to
+/// `binpkg::downgrade_job`: without it, `--deep` on `Target::Binpkgs`
+/// keeps only the *exact currently-installed* version of each package,
+/// deleting every older cached binpkg — precisely the ones a downgrade
+/// depends on. The tradeoff this accepts: a binpkg for a package that's
+/// since been fully *uninstalled* still gets cleaned (only versions of
+/// currently-installed packages are protected), and cleanup naturally
+/// finds less to reclaim than it used to.
 pub fn preview(target: Target) -> Result<CleanupPreview> {
     let output = Command::new(target.binary())
-        .args(["--pretend", "--deep", "--nocolor"])
+        .args(["--pretend", "--deep", "--package-names", "--nocolor"])
         .output()
         .with_context(|| format!("failed to run {}", target.binary()))?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -95,7 +105,7 @@ pub fn clean_job(target: Target) -> super::emerge::Job {
     super::emerge::Job {
         privileged: true,
         binary: target.binary().into(),
-        args: vec!["--deep".into(), "--nocolor".into()],
+        args: vec!["--deep".into(), "--package-names".into(), "--nocolor".into()],
         jobs_override: None,
     }
 }

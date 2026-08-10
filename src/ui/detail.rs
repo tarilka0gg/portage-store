@@ -1,9 +1,9 @@
-use crate::backend;
-use crate::flatpak;
-use crate::portage::eix::PackageSummary;
-use crate::portage::emerge::{self, InstallPreview};
-use crate::portage::installed::InstalledPackage;
-use crate::portage::{appstream, build_time, package_use, use_desc};
+use portage_store::backend;
+use portage_store::flatpak;
+use portage_store::portage::eix::PackageSummary;
+use portage_store::portage::emerge::{self, InstallPreview};
+use portage_store::portage::installed::InstalledPackage;
+use portage_store::portage::{appstream, build_time, package_use, use_desc};
 use crate::ui::runtime;
 use crate::ui::widgets;
 use adw::prelude::*;
@@ -373,6 +373,18 @@ fn screenshot_carousel(urls: &[String]) -> gtk::Widget {
     carousel.set_spacing(12);
     carousel.set_hexpand(true);
 
+    // Built early (normally populated at the bottom of this function)
+    // purely so `build_picture`'s fetch-failure closure below can hold a
+    // handle to it — see that closure's own comment for why.
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    panel.add_css_class("screenshot-carousel-panel");
+    // The same built-in style the "Download Size"/"Build Time" facts row
+    // uses — layered underneath our own class so its background wins over
+    // `@card_bg_color` there, matching exactly whatever this GTK theme
+    // actually renders `.card` as instead of assuming the two are the same
+    // color.
+    panel.add_css_class("card");
+
     let capped: Vec<String> = urls.iter().take(8).cloned().collect();
     let real_pages = capped.len() as u32;
     // Shared with the lightbox opened by clicking any one of these, so it
@@ -393,12 +405,24 @@ fn screenshot_carousel(urls: &[String]) -> gtk::Widget {
 
         let picture_for_fetch = picture.clone();
         let carousel_for_removal = carousel.clone();
+        let panel_for_removal = panel.clone();
         let paths = paths.clone();
         runtime::spawn_blocking(
-            move || crate::portage::media::fetch(&url),
+            move || portage_store::portage::media::fetch(&url),
             move |path| {
                 let Some(path) = path else {
                     carousel_for_removal.remove(&picture_for_fetch);
+                    // A failed fetch that was this carousel's *only*
+                    // picture (the common case: the GitHub social-preview
+                    // fallback card only ever has one, and that endpoint
+                    // doesn't always have a real image for a given repo)
+                    // would otherwise leave an empty card-shaped
+                    // background panel behind with no photo in it at all
+                    // — worse than showing nothing, so pull the whole
+                    // panel down with it instead.
+                    if carousel_for_removal.n_pages() == 0 && panel_for_removal.parent().is_some() {
+                        panel_for_removal.unparent();
+                    }
                     return;
                 };
                 picture_for_fetch.set_filename(Some(&path));
@@ -477,14 +501,6 @@ fn screenshot_carousel(urls: &[String]) -> gtk::Widget {
         column.append(&dots_row);
     }
 
-    let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    panel.add_css_class("screenshot-carousel-panel");
-    // The same built-in style the "Download Size"/"Build Time" facts row
-    // uses — layered underneath our own class so its background wins over
-    // `@card_bg_color` there, matching exactly whatever this GTK theme
-    // actually renders `.card` as instead of assuming the two are the same
-    // color.
-    panel.add_css_class("card");
     panel.append(&column);
     panel.upcast()
 }
@@ -541,8 +557,9 @@ fn truncate_at_sentence(text: &str, budget: usize) -> Option<String> {
 fn set_description(
     body_heading: &gtk::Label,
     body: &gtk::Label,
+    body_more: &gtk::Label,
+    body_more_revealer: &gtk::Revealer,
     show_more: &gtk::Button,
-    body_text: &Rc<RefCell<(String, String)>>,
     text: &str,
 ) {
     let mut paragraphs = text.splitn(2, "\n\n");
@@ -562,18 +579,25 @@ fn set_description(
         rest
     };
 
+    // Collapsed back to the start whenever new text arrives (one of the
+    // three enrichment sources answering) — `full` itself may be
+    // completely different text now, so whatever was previously revealed
+    // no longer corresponds to anything.
+    body_more_revealer.set_reveal_child(false);
+    show_more.set_label("Show More");
+
     match truncate_at_sentence(full, DESCRIPTION_COLLAPSE_BUDGET) {
         Some(collapsed) => {
-            *body_text.borrow_mut() = (collapsed.clone(), full.to_string());
+            let remainder = full[collapsed.len()..].trim_start();
             body.set_text(&collapsed);
             body.set_visible(true);
+            body_more.set_text(remainder);
             show_more.set_visible(true);
-            show_more.set_label("Show More");
         }
         None => {
-            *body_text.borrow_mut() = (full.to_string(), full.to_string());
             body.set_text(full);
             body.set_visible(!full.is_empty());
+            body_more.set_text("");
             show_more.set_visible(false);
         }
     }
@@ -788,6 +812,18 @@ fn info_tile(icon_name: &str, title: &str, subtitle: &str) -> (gtk::Button, gtk:
     subtitle_label.add_css_class("dim-label");
     subtitle_label.add_css_class("caption");
     subtitle_label.set_wrap(true);
+    // `set_wrap` alone only controls *how* the label lays out once it's
+    // already been given a width — it doesn't cap the width the label
+    // itself *requests*, so an unusually long value (a resolver failure
+    // reason, "Built from source, N packages" for a much bigger N once a
+    // USE flag pulls in more to build) could still ask for its whole
+    // unwrapped text on one line and drag the tile — and with it the
+    // page's own `adw::Clamp`, which only caps *maximum* width, not a
+    // child's minimum — wider than intended. `max_width_chars` is what
+    // actually bounds the natural size request, making the wrap above
+    // effective instead of merely theoretical.
+    subtitle_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    subtitle_label.set_max_width_chars(20);
     subtitle_label.set_justify(gtk::Justification::Center);
 
     let hint = gtk::Label::new(Some("⋯"));
@@ -830,18 +866,18 @@ fn gather_learn_more(
 ) -> LearnMoreContent {
     let man_page = installed
         .as_ref()
-        .and_then(|(category, _, version)| crate::portage::man::lookup(category, &name, version));
+        .and_then(|(category, _, version)| portage_store::portage::man::lookup(category, &name, version));
 
     let terminal_trove =
-        crate::portage::terminaltrove::lookup(&name).map(|entry| entry.description).unwrap_or_default();
+        portage_store::portage::terminaltrove::lookup(&name).map(|entry| entry.description).unwrap_or_default();
 
     // Same preference order as the eager enrichment chain above: an exact
     // repo recorded in the ebuild's own metadata.xml beats a fuzzy name
     // search, for the same reason (a small package can share its name with
     // a much more popular, unrelated repo).
     let repo = match use_desc::github_remote_id(&atom) {
-        Some(full_name) => crate::portage::github::lookup_known(&full_name),
-        None => crate::portage::github::lookup(&name),
+        Some(full_name) => portage_store::portage::github::lookup_known(&full_name),
+        None => portage_store::portage::github::lookup(&name),
     };
     let github_repo = repo.as_ref().map(|r| r.full_name.clone());
     let github_readme = repo.map(|r| r.readme_full).unwrap_or_default();
@@ -978,6 +1014,7 @@ fn use_flags_group(
     pkg: &PackageSummary,
     installed_pkg: Option<&InstalledPackage>,
     installed: &HashMap<String, InstalledPackage>,
+    on_changed: Rc<dyn Fn()>,
 ) -> Option<adw::PreferencesGroup> {
     if pkg.iuse.is_empty() {
         return None;
@@ -1041,14 +1078,14 @@ fn use_flags_group(
             let atom = atom.clone();
             let flag_name = flag.name.clone();
             info_button.connect_clicked(move |button| {
-                let source = crate::portage::flag_provenance::locate(&atom, &flag_name);
+                let source = portage_store::portage::flag_provenance::locate(&atom, &flag_name);
                 let popover = gtk::Popover::new();
                 let label = gtk::Label::new(Some(&source.label()));
                 label.set_margin_top(8);
                 label.set_margin_bottom(8);
                 label.set_margin_start(12);
                 label.set_margin_end(12);
-                popover.set_child(Some(&label));
+                animate_popover_content(&popover, &label);
                 popover.set_parent(button);
                 // A fresh popover is built on every click rather than
                 // reused, so it needs to unparent itself once closed —
@@ -1062,16 +1099,21 @@ fn use_flags_group(
 
         let atom = atom.clone();
         let flag_name = flag.name.clone();
+        let on_changed = on_changed.clone();
         row.connect_active_notify(move |row| {
-            if let Err(err) = package_use::set_flag(&atom, &flag_name, row.is_active())
-                && let Some(window) = row.root().and_downcast::<gtk::Window>() {
-                    let dialog = adw::AlertDialog::new(
-                        Some("Couldn't save USE flag"),
-                        Some(&err.to_string()),
-                    );
-                    dialog.add_response("ok", "OK");
-                    dialog.present(Some(&window));
+            match package_use::set_flag(&atom, &flag_name, row.is_active()) {
+                Ok(()) => on_changed(),
+                Err(err) => {
+                    if let Some(window) = row.root().and_downcast::<gtk::Window>() {
+                        let dialog = adw::AlertDialog::new(
+                            Some("Couldn't save USE flag"),
+                            Some(&err.to_string()),
+                        );
+                        dialog.add_response("ok", "OK");
+                        dialog.present(Some(&window));
+                    }
                 }
+            }
         });
         group.add(&row);
     }
@@ -1096,11 +1138,39 @@ fn menu_row_content(icon_name: &str, label: &str) -> gtk::Box {
 /// "⋮" menu's always-available copy of the same option) — kept as one
 /// function so the two can't drift into showing different wording for
 /// the same action.
+/// Wraps `popover`'s content in a `gtk::Revealer` that starts hidden and
+/// reveals itself the moment the popover shows. GTK popovers normally
+/// animate their own popup-surface transition, but that transition is the
+/// compositor's to render (each popover is its own subsurface/xdg-popup) —
+/// on a compositor that snaps popup surfaces straight into place instead
+/// of animating them, nothing in this app can make that surface-level
+/// transition visible. A widget-level content reveal doesn't have that
+/// problem: it's ordinary GTK repainting *inside* an already-placed
+/// surface, which always renders regardless of what the compositor does
+/// with the surface itself. `idle_add_local_once` defers actually
+/// flipping `reveal_child` to the next main-loop iteration — flipping it
+/// in the same frame the popover becomes visible skips the transition
+/// instead of playing it, the same reason a freshly-added CSS class only
+/// animates once something forces a fresh layout pass first.
+fn animate_popover_content(popover: &gtk::Popover, child: &impl IsA<gtk::Widget>) {
+    let revealer = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideDown)
+        .transition_duration(150)
+        .child(child)
+        .build();
+    popover.set_child(Some(&revealer));
+    popover.connect_show(move |_| {
+        revealer.set_reveal_child(false);
+        let revealer_for_idle = revealer.clone();
+        gtk::glib::idle_add_local_once(move || revealer_for_idle.set_reveal_child(true));
+    });
+}
+
 fn confirm_sandbox_build(button: &gtk::Button, atom: &str, display_name: &str, on_sandbox_build: &Rc<dyn Fn(String)>) {
     let Some(window) = button.root().and_downcast::<gtk::Window>() else {
         return;
     };
-    let first_run = !crate::portage::sandbox::is_set_up();
+    let first_run = !portage_store::portage::sandbox::is_set_up();
     let body = if first_run {
         format!(
             "{display_name} couldn't be resolved on your system directly. This builds it \
@@ -1129,6 +1199,67 @@ fn confirm_sandbox_build(button: &gtk::Button, atom: &str, display_name: &str, o
             on_sandbox_build(atom.clone());
         }
     });
+    dialog.present(Some(&window));
+}
+
+/// Lists every locally cached binpkg version (other than what's currently
+/// installed) with a one-click "Install" — no source-build/network step,
+/// just `binpkg::downgrade_job` against whichever version is picked.
+fn present_downgrade_dialog(
+    anchor: &impl IsA<gtk::Widget>,
+    atom: &str,
+    display_name: &str,
+    versions: &[portage_store::portage::binpkg::CachedVersion],
+    on_downgrade: &Rc<dyn Fn(String, String)>,
+) {
+    let Some(window) = anchor.root().and_downcast::<gtk::Window>() else {
+        return;
+    };
+
+    let list = gtk::ListBox::new();
+    list.add_css_class("boxed-list");
+    list.set_selection_mode(gtk::SelectionMode::None);
+
+    let description = gtk::Label::new(Some(&format!(
+        "Reinstalls {display_name} from a cached binary package — no download, no compiling."
+    )));
+    description.set_wrap(true);
+    description.add_css_class("dim-label");
+    description.set_margin_bottom(8);
+
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    column.set_margin_top(8);
+    column.set_margin_bottom(16);
+    column.set_margin_start(16);
+    column.set_margin_end(16);
+    column.append(&description);
+    column.append(&list);
+
+    let scroller = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).child(&column).build();
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scroller));
+
+    let dialog = adw::Dialog::builder().title("Reinstall From Cache").content_width(480).content_height(420).child(&toolbar).build();
+
+    for version in versions {
+        let row = adw::ActionRow::builder().title(&version.version).build();
+        let install_button = gtk::Button::with_label("Install");
+        install_button.add_css_class("flat");
+        install_button.set_valign(gtk::Align::Center);
+        let atom = atom.to_string();
+        let version = version.version.clone();
+        let on_downgrade = on_downgrade.clone();
+        let dialog_for_close = dialog.clone();
+        install_button.connect_clicked(move |_| {
+            on_downgrade(atom.clone(), version.clone());
+            dialog_for_close.close();
+        });
+        row.add_suffix(&install_button);
+        list.append(&row);
+    }
+
     dialog.present(Some(&window));
 }
 
@@ -1161,6 +1292,11 @@ pub fn build(
     // because installing prebuilt is faster than compiling from source
     // when there's a confident Flatpak match and no Portage binary.
     on_flatpak_install: Rc<dyn Fn(flatpak::FlatpakApp)>,
+    // Reinstalls this atom at a specific, already-cached version (see
+    // `binpkg::downgrade_job`) — offered from the overflow menu only once
+    // a background lookup finds at least one locally cached binpkg
+    // version other than what's currently installed.
+    on_downgrade: Rc<dyn Fn(String, String)>,
     // Called exactly once, as soon as the description/screenshot
     // enrichment chain (local AppStream, then Flathub, then — only if
     // still needed — Terminal Trove and GitHub) has either filled both or
@@ -1223,6 +1359,7 @@ pub fn build(
         let atom = atom.clone();
         let installed_state = installed_state.clone();
         let on_install = on_install.clone();
+        let on_uninstall = on_uninstall.clone();
         let display_name = display_name.clone();
         action_button.connect_clicked(move |b| {
             if installed_state.get() {
@@ -1302,7 +1439,7 @@ pub fn build(
          package only gets its own fresh instance if it actually conflicts with something \
          already built in an earlier one. First use downloads that base system (several \
          hundred MB) and can take a while.",
-        crate::portage::sandbox::MAX_SANDBOX_INSTANCES
+        portage_store::portage::sandbox::MAX_SANDBOX_INSTANCES
     )));
     sandbox_menu_row.connect_clicked({
         let atom = atom.clone();
@@ -1333,6 +1470,43 @@ pub fn build(
         }
     });
 
+    // Reinstall from a locally cached binpkg — only offered for an
+    // already-installed package, and only once a background lookup
+    // (below) actually finds a cached version other than what's running
+    // now; hidden otherwise, same "don't offer a click that has nothing
+    // behind it yet" treatment as `flatpak_menu_row`.
+    let downgrade_menu_row = gtk::Button::builder().child(&menu_row_content("document-revert-symbolic", "Reinstall From Cache…")).build();
+    downgrade_menu_row.add_css_class("flat");
+    downgrade_menu_row.set_visible(false);
+    let cached_versions: Rc<RefCell<Vec<portage_store::portage::binpkg::CachedVersion>>> = Rc::new(RefCell::new(Vec::new()));
+    if let Some(installed) = installed_pkg {
+        let atom_for_lookup = atom.clone();
+        let installed_version = installed.version.clone();
+        let cached_versions_write = cached_versions.clone();
+        let downgrade_menu_row_write = downgrade_menu_row.clone();
+        runtime::spawn_blocking(
+            move || portage_store::portage::binpkg::cached_versions(&atom_for_lookup).unwrap_or_default(),
+            move |versions| {
+                let other_versions: Vec<_> = versions.into_iter().filter(|v| v.version != installed_version).collect();
+                if !other_versions.is_empty() {
+                    *cached_versions_write.borrow_mut() = other_versions;
+                    downgrade_menu_row_write.set_visible(true);
+                }
+            },
+        );
+    }
+    downgrade_menu_row.connect_clicked({
+        let atom = atom.clone();
+        let display_name = display_name.clone();
+        let cached_versions = cached_versions.clone();
+        let on_downgrade = on_downgrade.clone();
+        let overflow_menu_button = overflow_menu_button.clone();
+        move |button| {
+            overflow_menu_button.popdown();
+            present_downgrade_dialog(button, &atom, &display_name, &cached_versions.borrow(), &on_downgrade);
+        }
+    });
+
     let overflow_column = gtk::Box::new(gtk::Orientation::Vertical, 2);
     overflow_column.set_margin_top(6);
     overflow_column.set_margin_bottom(6);
@@ -1340,8 +1514,9 @@ pub fn build(
     overflow_column.set_margin_end(6);
     overflow_column.append(&sandbox_menu_row);
     overflow_column.append(&flatpak_menu_row);
+    overflow_column.append(&downgrade_menu_row);
     let overflow_popover = gtk::Popover::new();
-    overflow_popover.set_child(Some(&overflow_column));
+    animate_popover_content(&overflow_popover, &overflow_column);
     overflow_menu_button.set_popover(Some(&overflow_popover));
 
     // Whether Portage has no binary for this package — set once the
@@ -1424,7 +1599,33 @@ pub fn build(
     // explanation instead of the one-line "Conflicts with another
     // package" the Install Method tile alone can show.
     let blocker_banner = adw::Banner::new("");
+    blocker_banner.set_button_label(Some("Details"));
     content_top.append(&blocker_banner);
+    // Kept in sync with the banner's own title/revealed state inside
+    // `apply_pretend_result` below (and, since USE-flag toggles can now
+    // trigger a fresh `--pretend` run — see `refresh_pretend` — this can
+    // be updated more than once per page). The click handler is wired
+    // once, here, and reads whatever's current at click time rather than
+    // capturing one fixed list.
+    let current_blockers: Rc<RefCell<Vec<emerge::BlockerInfo>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let current_blockers = current_blockers.clone();
+        let installed = installed.clone();
+        let atom = atom.clone();
+        let on_install = on_install.clone();
+        let on_uninstall = on_uninstall.clone();
+        blocker_banner.connect_button_clicked(move |banner| {
+            let on_remove_and_retry: Rc<dyn Fn(String, String)> = {
+                let on_install = on_install.clone();
+                let on_uninstall = on_uninstall.clone();
+                Rc::new(move |blocking_atom: String, target_atom: String| {
+                    on_uninstall(blocking_atom);
+                    on_install(target_atom);
+                })
+            };
+            super::blocker_dialog::present(banner, &atom, &current_blockers.borrow(), &installed, on_remove_and_retry);
+        });
+    }
 
     // "Blast radius" — the one detail a package count and a download size
     // don't say out loud: whether this pulls in a toolchain component
@@ -1469,31 +1670,31 @@ pub fn build(
     body.set_visible(false);
     content.append(&body);
 
+    // The collapsed-away remainder of the text — always the same widget,
+    // shown/hidden with a real slide animation via the revealer around it,
+    // rather than the old approach of just swapping `body`'s text in place
+    // (a `set_text` call can't animate; nothing on screen indicated
+    // anything had changed besides the label content jumping straight to
+    // its new state).
+    let body_more = gtk::Label::new(None);
+    body_more.set_xalign(0.0);
+    body_more.set_wrap(true);
+    body_more.add_css_class("description-body");
+    let body_more_revealer =
+        gtk::Revealer::builder().transition_type(gtk::RevealerTransitionType::SlideDown).child(&body_more).build();
+    content.append(&body_more_revealer);
+
     let show_more = gtk::Button::with_label("Show More");
     show_more.add_css_class("pill");
     show_more.set_halign(gtk::Align::Center);
     show_more.set_visible(false);
     content.append(&show_more);
 
-    // (collapsed, full) text for whichever description last answered —
-    // `set_description` fills this in; the click handler below just swaps
-    // between the two rather than re-deriving either.
-    let body_text: Rc<RefCell<(String, String)>> = Rc::new(RefCell::new((String::new(), String::new())));
-    let body_expanded = Cell::new(false);
-    let body_for_toggle = body.clone();
-    let body_text_for_toggle = body_text.clone();
-    let show_more_for_toggle = show_more.clone();
-    show_more.connect_clicked(move |_| {
-        let expanded = !body_expanded.get();
-        body_expanded.set(expanded);
-        let (collapsed, full) = &*body_text_for_toggle.borrow();
-        if expanded {
-            body_for_toggle.set_text(full);
-            show_more_for_toggle.set_label("Show Less");
-        } else {
-            body_for_toggle.set_text(collapsed);
-            show_more_for_toggle.set_label("Show More");
-        }
+    let body_more_revealer_for_toggle = body_more_revealer.clone();
+    show_more.connect_clicked(move |button| {
+        let expanded = !body_more_revealer_for_toggle.reveals_child();
+        body_more_revealer_for_toggle.set_reveal_child(expanded);
+        button.set_label(if expanded { "Show Less" } else { "Show More" });
     });
 
     // Declared here, populated in its usual place further down, but
@@ -1520,7 +1721,7 @@ pub fn build(
         use_desc::long_description(&atom).filter(|long| *long != pkg.description)
     };
     if let Some(text) = &local_text {
-        set_description(&body_heading, &body, &show_more, &body_text, text);
+        set_description(&body_heading, &body, &body_more, &body_more_revealer, &show_more, text);
     }
 
     // Whatever the tree couldn't supply, ask Flathub for — it covers GUI
@@ -1533,7 +1734,7 @@ pub fn build(
     let description_filled = Rc::new(Cell::new(local_text.is_some()));
     let screenshots_filled = Rc::new(Cell::new(!appstream.screenshots.is_empty()));
     let needs_icon = installed_icons.get(&atom).is_none()
-        && crate::portage::icons::resolve_by_name(&pkg.name).is_none();
+        && portage_store::portage::icons::resolve_by_name(&pkg.name).is_none();
 
     {
         let on_ready = on_ready.clone();
@@ -1543,18 +1744,19 @@ pub fn build(
         let hero_icon = icon.clone();
         let body_heading = body_heading.clone();
         let body = body.clone();
+        let body_more = body_more.clone();
+        let body_more_revealer = body_more_revealer.clone();
         let show_more = show_more.clone();
-        let body_text = body_text.clone();
         let screenshot_slot = screenshot_slot.clone();
         let details = details.clone();
         let description_filled = description_filled.clone();
         let screenshots_filled = screenshots_filled.clone();
         runtime::spawn_blocking(
-            move || crate::portage::flathub::lookup(&name),
+            move || portage_store::portage::flathub::lookup(&name),
             move |app| {
                 if let Some(app) = &app {
                     if !description_filled.get() && !app.description.is_empty() {
-                        set_description(&body_heading, &body, &show_more, &body_text, &app.description);
+                        set_description(&body_heading, &body, &body_more, &body_more_revealer, &show_more, &app.description);
                         description_filled.set(true);
                     }
                     if !screenshots_filled.get() && !app.screenshots.is_empty() {
@@ -1565,7 +1767,7 @@ pub fn build(
                         && let Some(url) = app.icon.clone() {
                             let hero_icon = hero_icon.clone();
                             runtime::spawn_blocking(
-                                move || crate::portage::media::fetch(&url),
+                                move || portage_store::portage::media::fetch(&url),
                                 move |path| {
                                     if let (Some(path), Some(image)) =
                                         (path, hero_icon.downcast_ref::<gtk::Image>())
@@ -1594,18 +1796,19 @@ pub fn build(
                     let atom_gh_outer = atom_for_github.clone();
                     let body_heading = body_heading.clone();
                     let body = body.clone();
+                    let body_more = body_more.clone();
+                    let body_more_revealer = body_more_revealer.clone();
                     let show_more = show_more.clone();
-                    let body_text = body_text.clone();
                     let screenshot_slot = screenshot_slot.clone();
                     let details = details.clone();
                     let description_filled = description_filled.clone();
                     let screenshots_filled = screenshots_filled.clone();
                     runtime::spawn_blocking(
-                        move || crate::portage::terminaltrove::lookup(&name_tt),
+                        move || portage_store::portage::terminaltrove::lookup(&name_tt),
                         move |entry| {
                             if let Some(entry) = entry {
                                 if !description_filled.get() && !entry.description.is_empty() {
-                                    set_description(&body_heading, &body, &show_more, &body_text, &entry.description);
+                                    set_description(&body_heading, &body, &body_more, &body_more_revealer, &show_more, &entry.description);
                                     description_filled.set(true);
                                 }
                                 if !screenshots_filled.get() && !entry.screenshot.is_empty() {
@@ -1618,8 +1821,9 @@ pub fn build(
                                 let on_ready = on_ready.clone();
                                 let body_heading = body_heading.clone();
                                 let body = body.clone();
+                                let body_more = body_more.clone();
+                                let body_more_revealer = body_more_revealer.clone();
                                 let show_more = show_more.clone();
-                                let body_text = body_text.clone();
                                 let screenshot_slot = screenshot_slot.clone();
                                 let details = details.clone();
                                 let description_filled = description_filled.clone();
@@ -1636,8 +1840,8 @@ pub fn build(
                                         // system instead, because it's the far
                                         // more popular repo with a matching name.
                                         match use_desc::github_remote_id(&atom_gh) {
-                                            Some(full_name) => crate::portage::github::lookup_known(&full_name),
-                                            None => crate::portage::github::lookup(&name_gh),
+                                            Some(full_name) => portage_store::portage::github::lookup_known(&full_name),
+                                            None => portage_store::portage::github::lookup(&name_gh),
                                         }
                                     },
                                     move |repo| {
@@ -1655,7 +1859,7 @@ pub fn build(
                                         };
                                         if !description_filled.get()
                                             && let Some(text) = text {
-                                                set_description(&body_heading, &body, &show_more, &body_text, &text);
+                                                set_description(&body_heading, &body, &body_more, &body_more_revealer, &show_more, &text);
                                             }
                                         if !screenshots_filled.get() {
                                             if !repo.readme_screenshots.is_empty() {
@@ -1793,7 +1997,7 @@ pub fn build(
         runtime::spawn_blocking(
             move || {
                 let atoms: Vec<String> = packages.iter().map(|pkg| pkg.atom.clone()).collect();
-                let mut averages = crate::portage::qlop::average_merge_seconds_batch(&atoms);
+                let mut averages = portage_store::portage::qlop::average_merge_seconds_batch(&atoms);
                 packages
                     .into_iter()
                     .map(|pkg| {
@@ -1972,7 +2176,7 @@ pub fn build(
             let make_picker2 = make_picker.clone();
             runtime::spawn_blocking(
                 move || {
-                    let versions = crate::portage::eix::list_versions(&atom_fetch).unwrap_or_default();
+                    let versions = portage_store::portage::eix::list_versions(&atom_fetch).unwrap_or_default();
                     // Newest few only: probing every historical version is
                     // both slow (one `emerge --pretend` subprocess each)
                     // and pointless, since nobody wants a five-year-old
@@ -2016,7 +2220,7 @@ pub fn build(
         let measured = measured.clone();
         let time_value = time_value.clone();
         runtime::spawn_blocking(
-            move || crate::portage::qlop::average_merge_seconds(&atom),
+            move || portage_store::portage::qlop::average_merge_seconds(&atom),
             move |result| {
                 if let Some((seconds, merges)) = result {
                     measured.set(true);
@@ -2049,6 +2253,7 @@ pub fn build(
     let overflow_menu_button_write = overflow_menu_button.clone();
     let disk_space_banner_write = disk_space_banner.clone();
     let blocker_banner_write = blocker_banner.clone();
+    let current_blockers_write = current_blockers.clone();
     let toolchain_banner_write = toolchain_banner.clone();
     let needs_source_build_write = needs_source_build.clone();
     let flatpak_menu_row_write = flatpak_menu_row.clone();
@@ -2111,7 +2316,7 @@ pub fn build(
             None => "Unknown".to_string(),
         });
 
-        match preview.download_kib.and_then(crate::portage::diskspace::low_space_warning) {
+        match preview.download_kib.and_then(portage_store::portage::diskspace::low_space_warning) {
             Some(warning) => {
                 disk_space_banner_write.set_title(&warning);
                 disk_space_banner_write.set_revealed(true);
@@ -2142,8 +2347,10 @@ pub fn build(
                 first.atom
             ));
             blocker_banner_write.set_revealed(true);
+            *current_blockers_write.borrow_mut() = blockers;
         } else {
             blocker_banner_write.set_revealed(false);
+            current_blockers_write.borrow_mut().clear();
         }
 
         // `prebuilt` (the `-bin`-named-ebuild heuristic) only catches
@@ -2204,17 +2411,61 @@ pub fn build(
             None => "Unknown".to_string(),
         });
     };
+    // Wrapped so a USE flag toggle (see `use_flags_group`'s `on_changed`
+    // below) can reuse the exact same "take fresh pretend lines, refresh
+    // every tile/banner" logic a third time, rather than duplicating it —
+    // `apply_pretend_result` only ever reads through its captured
+    // `Rc`/`Cell`/`RefCell`s, so calling it more than once is already safe.
+    let apply_pretend_result: Rc<dyn Fn(bool)> = Rc::new(apply_pretend_result);
 
     if let Some((cached_success, cached_lines)) = emerge::cached_pretend(&atom, &pkg.latest_version) {
         *lines.borrow_mut() = cached_lines;
         apply_pretend_result(cached_success);
     } else {
+        let apply_pretend_result = apply_pretend_result.clone();
         runtime::spawn_job(
             emerge::pretend_install_job(&atom, prefer_binpkg),
             move |line| collect.borrow_mut().push(line),
-            apply_pretend_result,
+            move |success| apply_pretend_result(success),
         );
     }
+
+    // Re-runs the `--pretend` resolution from scratch — used after a USE
+    // flag changes, since that can change the download size, whether it
+    // compiles, and even whether it resolves at all, and the cached
+    // result (keyed only by atom/version, see `emerge::cached_pretend`)
+    // has no way to know a flag just moved under it.
+    let refresh_pretend: Rc<dyn Fn()> = Rc::new({
+        let atom = atom.clone();
+        let lines = lines.clone();
+        let pretend_ready = pretend_ready.clone();
+        let size_value = size_value.clone();
+        let method_value = method_value.clone();
+        let time_value = time_value.clone();
+        let apply_pretend_result = apply_pretend_result.clone();
+        move || {
+            pretend_ready.set(false);
+            size_value.set_text("Recalculating…");
+            method_value.set_text("Recalculating…");
+            time_value.set_text("Recalculating…");
+            emerge::invalidate_pretend(&atom);
+
+            let collect: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+            let lines_for_apply = lines.clone();
+            let apply_pretend_result = apply_pretend_result.clone();
+            runtime::spawn_job(
+                emerge::pretend_install_job(&atom, prefer_binpkg),
+                {
+                    let collect = collect.clone();
+                    move |line| collect.borrow_mut().push(line)
+                },
+                move |success| {
+                    *lines_for_apply.borrow_mut() = collect.borrow().clone();
+                    apply_pretend_result(success);
+                },
+            );
+        }
+    });
 
     // --- details + upstream links ------------------------------------
     // Declared here but populated below at its usual place in reading
@@ -2236,6 +2487,15 @@ pub fn build(
     category_row.add_prefix(&gtk::Image::from_icon_name("package-x-generic-symbolic"));
     details.append(&category_row);
 
+    // Suppressed for the trivial, uninformative case (see
+    // `PackageSummary::slot_label`) — a bare `SLOT="0"` with no sub-slot
+    // is true of most packages and says nothing worth a row for.
+    if let Some(slot_label) = pkg.slot_label() {
+        let slot_row = adw::ActionRow::builder().title("Slot").subtitle(&slot_label).build();
+        slot_row.add_prefix(&gtk::Image::from_icon_name("view-list-bullet-symbolic"));
+        details.append(&slot_row);
+    }
+
     for url in pkg.homepage.split_whitespace() {
         details.append(&link_row("web-browser-symbolic", "Project Website", url));
     }
@@ -2254,7 +2514,7 @@ pub fn build(
     let bugzilla_row = adw::ActionRow::builder().title("Gentoo Bugzilla").subtitle("Checking…").build();
     bugzilla_row.add_prefix(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
     bugzilla_row.set_activatable(true);
-    let bugzilla_url = crate::portage::gentoo_web::bugzilla_search_url(&atom);
+    let bugzilla_url = portage_store::portage::gentoo_web::bugzilla_search_url(&atom);
     {
         let title = "Gentoo Bugzilla".to_string();
         let url = bugzilla_url.clone();
@@ -2268,7 +2528,7 @@ pub fn build(
         let wiki_row = wiki_row.clone();
         let bugzilla_row = bugzilla_row.clone();
         runtime::spawn_blocking(
-            move || crate::portage::gentoo_web::lookup(&atom_for_context, &display_name_for_context),
+            move || portage_store::portage::gentoo_web::lookup(&atom_for_context, &display_name_for_context),
             move |context| {
                 if let Some(url) = context.wiki_url {
                     wiki_row.set_subtitle(&url);
@@ -2358,7 +2618,7 @@ pub fn build(
     content.append(&group);
 
     // --- USE flags ---------------------------------------------------
-    if let Some(group) = use_flags_group(pkg, installed_pkg, installed) {
+    if let Some(group) = use_flags_group(pkg, installed_pkg, installed, refresh_pretend.clone()) {
         content.append(&group);
     }
 

@@ -1,6 +1,6 @@
 use super::{App, QueueEntry};
-use crate::portage::overlays::{self, Overlay};
-use crate::portage::{binrepos, config_history, emerge, make_conf, package_env, priv_write, profile_bundle, world};
+use portage_store::portage::overlays::{self, Overlay};
+use portage_store::portage::{binrepos, config_history, emerge, make_conf, package_env, priv_write, profile_bundle, world};
 use crate::ui::runtime;
 use adw::prelude::*;
 use std::cell::RefCell;
@@ -14,10 +14,56 @@ use std::rc::Rc;
 /// byte-for-byte alone, because make.conf routinely contains shell
 /// constructs (`${COMMON_FLAGS}`, conditionals) that a naive rewrite would
 /// destroy.
+/// Adds `page` to `stack` under `name`, plus a matching row in
+/// `sidebar_list` — reusing whatever title/icon the page already set on
+/// itself (`AdwPreferencesPage::title`/`icon_name`, which every
+/// page-building function here already calls) rather than duplicating
+/// those strings a second time just for the sidebar row.
+///
+/// A hand-built `ListBox` row rather than `gtk::StackSidebar`:
+/// `StackSidebar` is a real GTK widget for exactly this "sidebar driving a
+/// stack" job, but it's title-only by design — it has no way to show a
+/// `StackPage`'s icon at all, which is the one thing this needed after
+/// moving off the bottom switcher (that one showed icon + label together).
+fn add_switcher_page(stack: &gtk::Stack, sidebar_list: &gtk::ListBox, page: &adw::PreferencesPage, name: &str) {
+    stack.add_named(page, Some(name));
+
+    let content = adw::ActionRow::builder().title(page.title()).activatable(true).build();
+    if let Some(icon) = page.icon_name() {
+        content.add_prefix(&gtk::Image::from_icon_name(&icon));
+    }
+
+    // Built explicitly (rather than `sidebar_list.append(&content)`,
+    // which would auto-wrap `content` in a `GtkListBoxRow` of its own) so
+    // `name` can be stashed on the actual row `connect_row_activated`
+    // below receives — setting it on `content` instead would set it on
+    // the wrong widget, one level too deep for the signal handler to see.
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&content));
+    row.set_widget_name(name);
+    sidebar_list.append(&row);
+}
+
 pub fn present(app: &Rc<App>) {
     let parent = &app.window;
-    let dialog = adw::PreferencesDialog::new();
-    dialog.set_title("Portage Settings");
+
+    // `AdwPreferencesDialog`'s own built-in page switcher is a bottom tab
+    // bar with no left-sidebar mode in this libadwaita version — a plain
+    // `gtk::Stack` driven by a hand-built row list gives the actual
+    // left-side, icon-and-title page list instead, at the cost of
+    // building the dialog shell by hand. Every individual page below is
+    // still an ordinary `adw::PreferencesPage` (self-contained,
+    // independently scrollable), so none of that code needed to change —
+    // only how the pages get assembled together.
+    let stack = gtk::Stack::new();
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    stack.set_hexpand(true);
+
+    let sidebar_list = gtk::ListBox::new();
+    // The same style class `gtk::StackSidebar` itself uses internally —
+    // gets the same selected-row highlight and background this dialog
+    // had before, without inheriting that widget's title-only limitation.
+    sidebar_list.add_css_class("navigation-sidebar");
 
     let page = adw::PreferencesPage::new();
     page.set_title("make.conf");
@@ -31,7 +77,15 @@ pub fn present(app: &Rc<App>) {
                 .description(err.to_string())
                 .build();
             page.add(&group);
-            dialog.add(&page);
+            let toolbar = adw::ToolbarView::new();
+            toolbar.add_top_bar(&adw::HeaderBar::new());
+            toolbar.set_content(Some(&page));
+            let dialog = adw::Dialog::builder()
+                .title("Portage Settings")
+                .content_width(900)
+                .content_height(700)
+                .child(&toolbar)
+                .build();
             dialog.present(Some(parent));
             return;
         }
@@ -126,48 +180,149 @@ pub fn present(app: &Rc<App>) {
     if config_history::is_tracked() {
         let history_group = adw::PreferencesGroup::builder()
             .title("Change History")
-            .description("Every change this app has made to /etc/portage.")
+            .description("Every change this app has made to /etc/portage — view the diff or revert to any point.")
             .build();
 
-        if config_history::can_revert() {
-            let revert_button = gtk::Button::with_label("Revert Last Change");
-            revert_button.add_css_class("pill");
-            revert_button.set_halign(gtk::Align::Start);
-            let status = gtk::Label::new(None);
-            status.add_css_class("dim-label");
-            status.set_wrap(true);
-            {
-                let status = status.clone();
-                revert_button.connect_clicked(move |button| {
-                    button.set_sensitive(false);
-                    match config_history::revert_last() {
-                        Ok(()) => status.set_text("Reverted. Reopen Settings to see the updated history."),
-                        Err(err) => {
-                            status.set_text(&format!("Couldn't revert: {err}"));
-                            button.set_sensitive(true);
-                        }
-                    }
-                });
-            }
-            history_group.add(&revert_button);
-            history_group.add(&status);
-        }
+        let status = gtk::Label::new(None);
+        status.add_css_class("dim-label");
+        status.set_wrap(true);
 
-        if let Ok(commits) = config_history::history(20) {
-            for commit in commits {
-                let row = adw::ActionRow::builder().title(commit.message).subtitle(commit.relative_time).build();
+        if let Ok(commits) = config_history::history(50) {
+            // The repo's very first commit is always the pre-app baseline
+            // snapshot (see `priv_write`'s doc comments) — reverting *to*
+            // it is meaningless (there's nothing before it) and reverting
+            // *it* would mean undoing something this app never did, so it
+            // gets a diff button but no revert button, same distinction
+            // `can_revert()` already draws for the single "revert last"
+            // action this replaces.
+            let revertable = commits.len().saturating_sub(1);
+            for (i, commit) in commits.into_iter().enumerate() {
+                let row = adw::ActionRow::builder()
+                    .title(&commit.message)
+                    .subtitle(format!("{} · {}", commit.relative_time, commit.hash))
+                    .build();
                 row.add_prefix(&gtk::Image::from_icon_name("document-edit-symbolic"));
+
+                let diff_button = gtk::Button::from_icon_name("text-x-generic-symbolic");
+                diff_button.add_css_class("flat");
+                diff_button.set_valign(gtk::Align::Center);
+                diff_button.set_tooltip_text(Some("View diff"));
+                let hash_for_diff = commit.hash.clone();
+                let parent_for_diff = parent.clone();
+                let message_for_diff = commit.message.clone();
+                diff_button.connect_clicked(move |_| {
+                    present_commit_diff(&parent_for_diff, &message_for_diff, &hash_for_diff);
+                });
+                row.add_suffix(&diff_button);
+
+                if i < revertable {
+                    let revert_button = gtk::Button::from_icon_name("edit-undo-symbolic");
+                    revert_button.add_css_class("flat");
+                    revert_button.set_valign(gtk::Align::Center);
+                    revert_button.set_tooltip_text(Some("Revert to here"));
+                    let hash_for_revert = commit.hash.clone();
+                    let status = status.clone();
+                    let parent_for_confirm = parent.clone();
+                    revert_button.connect_clicked(move |button| {
+                        let dialog = adw::AlertDialog::new(
+                            Some("Revert to this point?"),
+                            Some("This rewrites the live files under /etc/portage back to how they looked at this commit, as a new commit of its own."),
+                        );
+                        dialog.add_response("cancel", "Cancel");
+                        dialog.add_response("revert", "Revert");
+                        dialog.set_response_appearance("revert", adw::ResponseAppearance::Destructive);
+                        dialog.set_default_response(Some("cancel"));
+                        dialog.set_close_response("cancel");
+                        let button = button.clone();
+                        let hash_for_revert = hash_for_revert.clone();
+                        let status = status.clone();
+                        dialog.connect_response(None, move |_, response| {
+                            if response != "revert" {
+                                return;
+                            }
+                            button.set_sensitive(false);
+                            match config_history::revert(&hash_for_revert) {
+                                Ok(()) => status.set_text("Reverted. Reopen Settings to see the updated history."),
+                                Err(err) => {
+                                    status.set_text(&format!("Couldn't revert: {err}"));
+                                    button.set_sensitive(true);
+                                }
+                            }
+                        });
+                        dialog.present(Some(&parent_for_confirm));
+                    });
+                    row.add_suffix(&revert_button);
+                }
+
                 history_group.add(&row);
             }
         }
+        history_group.add(&status);
         page.add(&history_group);
     }
 
-    dialog.add(&page);
-    dialog.add(&binpkg_page());
-    dialog.add(&overlays_page());
-    dialog.add(&env_page());
-    dialog.add(&profile_page(app));
+    add_switcher_page(&stack, &sidebar_list, &page, "make-conf");
+    add_switcher_page(&stack, &sidebar_list, &binpkg_page(), "binpkg");
+    add_switcher_page(&stack, &sidebar_list, &overlays_page(), "overlays");
+    add_switcher_page(&stack, &sidebar_list, &env_page(), "env-files");
+    add_switcher_page(&stack, &sidebar_list, &super::profile_switch::page(app), "build-profile");
+    add_switcher_page(&stack, &sidebar_list, &super::kernel_page::page(app), "kernel");
+    add_switcher_page(&stack, &sidebar_list, &super::audit_log_page::page(app), "privileged-actions");
+    add_switcher_page(&stack, &sidebar_list, &profile_page(app), "profile-bundle");
+
+    // The stack starts on its first-added page on its own, but the
+    // sidebar's own selection doesn't follow automatically — without this
+    // the list opens with nothing highlighted even though "make.conf" is
+    // what's actually showing.
+    if let Some(first_row) = sidebar_list.row_at_index(0) {
+        sidebar_list.select_row(Some(&first_row));
+    }
+    let stack_for_selection = stack.clone();
+    sidebar_list.connect_row_activated(move |_, row| {
+        stack_for_selection.set_visible_child_name(&row.widget_name());
+    });
+
+    let sidebar_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .width_request(200)
+        .child(&sidebar_list)
+        .build();
+
+    let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    body.append(&sidebar_scroller);
+    body.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    body.append(&stack);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&body));
+
+    let dialog =
+        adw::Dialog::builder().title("Portage Settings").content_width(900).content_height(700).child(&toolbar).build();
+    dialog.present(Some(parent));
+}
+
+/// One commit's full patch — a plain, read-only `git show`, fetched
+/// synchronously (a local, single-commit diff is fast enough that this
+/// file's other git reads, like `history()` above, already run inline
+/// rather than through `runtime::spawn_blocking`).
+fn present_commit_diff(parent: &adw::ApplicationWindow, message: &str, hash: &str) {
+    let text_view = gtk::TextView::new();
+    text_view.set_editable(false);
+    text_view.set_cursor_visible(false);
+    text_view.set_monospace(true);
+    text_view.set_left_margin(8);
+    text_view.set_top_margin(6);
+    text_view.set_bottom_margin(6);
+    text_view.buffer().set_text(&config_history::diff(hash).unwrap_or_else(|err| format!("Couldn't load diff: {err}")));
+
+    let scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&text_view).build();
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scroller));
+
+    let dialog = adw::Dialog::builder().title(message).content_width(700).content_height(600).child(&toolbar).build();
     dialog.present(Some(parent));
 }
 
@@ -375,8 +530,9 @@ fn present_import_diff(app: &Rc<App>, bundle: profile_bundle::ExtractedBundle, d
                 Ok(()) => {
                     if !selected_atoms.is_empty() {
                         let getbinpkg = app.settings.borrow().prefer_binary_packages;
+                        let buildpkg = app.settings.borrow().buildpkg_on_install;
                         app.enqueue(QueueEntry {
-                            job: emerge::install_many_job(&selected_atoms, getbinpkg),
+                            job: emerge::install_many_job(&selected_atoms, getbinpkg, buildpkg),
                             label: "Installing imported profile's packages".to_string(),
                             mutating: true,
                             retry_with_use_fix: false,

@@ -1,5 +1,5 @@
 use super::{App, QueueEntry};
-use crate::portage::{depclean, emerge};
+use portage_store::portage::{depclean, emerge};
 use crate::ui::runtime;
 use adw::prelude::*;
 use std::cell::RefCell;
@@ -215,8 +215,9 @@ pub fn present(app: &Rc<App>, on_dismissed: Rc<dyn Fn()>) {
                 checkboxes.borrow().iter().filter(|(_, c)| c.is_active()).map(|(atom, _)| atom.to_string()).collect();
             if !selected.is_empty() {
                 let getbinpkg = app.settings.borrow().prefer_binary_packages;
+                let buildpkg = app.settings.borrow().buildpkg_on_install;
                 app.enqueue(QueueEntry {
-                    job: emerge::install_many_job(&selected, getbinpkg),
+                    job: emerge::install_many_job(&selected, getbinpkg, buildpkg),
                     label: "Installing starter picks".to_string(),
                     mutating: true,
                     retry_with_use_fix: true,

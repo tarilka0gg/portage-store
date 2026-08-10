@@ -161,6 +161,7 @@ mod tests {
             iuse: Vec::new(),
             masked: false,
             overlay: None,
+            slot: None,
         }
     }
 

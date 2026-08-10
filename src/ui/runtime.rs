@@ -1,4 +1,4 @@
-use crate::portage::emerge::{self, EmergeEvent, Job};
+use portage_store::portage::emerge::{self, EmergeEvent, Job};
 use gtk::glib;
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;

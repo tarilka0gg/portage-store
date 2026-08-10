@@ -1,4 +1,4 @@
-use crate::portage::reverse_deps::{self, DepNode};
+use portage_store::portage::reverse_deps::{self, DepNode};
 use crate::ui::runtime;
 use adw::prelude::*;
 

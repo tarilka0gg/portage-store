@@ -1,7 +1,7 @@
+use super::command::{CommandRunner, RealCommandRunner};
 use super::world;
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::process::Command;
 
 /// How many levels up the "who depends on this" chain to follow before
 /// stopping. Four is enough to reach an `@world`-selected package (the
@@ -82,14 +82,14 @@ fn strip_version(atom_with_version: &str) -> String {
 /// faster and the right scope here: an ebuild in the tree that *could*
 /// depend on this but isn't even installed can't be the reason something
 /// else on this exact system is.
-fn direct_dependents(bare_atom: &str) -> Vec<String> {
-    let output = Command::new("equery").args(["--no-color", "depends", bare_atom]).output();
-    let Ok(output) = output else { return Vec::new() };
+fn direct_dependents(runner: &impl CommandRunner, bare_atom: &str) -> Vec<String> {
+    let Ok(output) = runner.output("equery", &["--no-color", "depends", bare_atom]) else { return Vec::new() };
     let text = String::from_utf8_lossy(&output.stdout);
     text.lines().map(|l| strip_ansi(l.trim())).filter(|l| !l.is_empty()).collect()
 }
 
 fn build_tree(
+    runner: &impl CommandRunner,
     atom_with_version: &str,
     world_atoms: &HashSet<String>,
     depth_remaining: u32,
@@ -108,13 +108,13 @@ fn build_tree(
     // graph would make the search revisit the same subtree repeatedly).
     if !in_world && depth_remaining > 0 && calls_remaining.get() > 0 && visited.insert(atom_with_version.to_string()) {
         calls_remaining.set(calls_remaining.get() - 1);
-        let dependents = direct_dependents(&bare);
+        let dependents = direct_dependents(runner, &bare);
         total_children = dependents.len();
         for parent in dependents.into_iter().take(MAX_CHILDREN) {
             if calls_remaining.get() == 0 {
                 break;
             }
-            children.push(build_tree(&parent, world_atoms, depth_remaining - 1, visited, calls_remaining));
+            children.push(build_tree(runner, &parent, world_atoms, depth_remaining - 1, visited, calls_remaining));
         }
     }
 
@@ -127,15 +127,20 @@ fn build_tree(
 /// several `equery` subprocesses (bounded by `MAX_EQUERY_CALLS` no matter
 /// how connected the dependency graph is); call off the main thread.
 pub fn why_installed(atom_with_version: &str) -> DepNode {
+    why_installed_with(&RealCommandRunner, atom_with_version)
+}
+
+fn why_installed_with(runner: &impl CommandRunner, atom_with_version: &str) -> DepNode {
     let world_atoms: HashSet<String> = world::read().unwrap_or_default().into_iter().collect();
     let mut visited = HashSet::new();
     let calls_remaining = Cell::new(MAX_EQUERY_CALLS);
-    build_tree(atom_with_version, &world_atoms, MAX_DEPTH, &mut visited, &calls_remaining)
+    build_tree(runner, atom_with_version, &world_atoms, MAX_DEPTH, &mut visited, &calls_remaining)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::portage::command::fake::{FakeCommandRunner, ok};
 
     #[test]
     fn strips_the_version_suffix() {
@@ -146,5 +151,70 @@ mod tests {
     #[test]
     fn atom_without_a_version_suffix_is_unchanged() {
         assert_eq!(strip_version("dev-libs/glib"), "dev-libs/glib");
+    }
+
+    /// A fixed, wider-than-`MAX_CHILDREN` dependent list — every `equery
+    /// depends` call in these tests sees the same fixture (the fake
+    /// runner keys by program name only), which is exactly what a real
+    /// dependency graph's diamonds/reconvergences look like from this
+    /// function's perspective: the same atom string showing up as a
+    /// "dependent" via more than one path.
+    fn wide_dependents_fixture() -> String {
+        (0..15).map(|i| format!("dev-libs/fake-dep-{i}-1.0")).collect::<Vec<_>>().join("\n")
+    }
+
+    fn max_depth(node: &DepNode) -> u32 {
+        1 + node.children.iter().map(max_depth).max().unwrap_or(0)
+    }
+
+    #[test]
+    fn a_node_reports_its_true_dependent_count_but_caps_real_children() {
+        let runner = FakeCommandRunner::new();
+        runner.respond("equery", ok(&wide_dependents_fixture()));
+        let mut visited = HashSet::new();
+        let calls_remaining = Cell::new(MAX_EQUERY_CALLS);
+        let node = build_tree(&runner, "dev-libs/root-1.0", &HashSet::new(), MAX_DEPTH, &mut visited, &calls_remaining);
+        assert_eq!(node.total_children, 15, "the honest count the UI's \"+N more\" relies on");
+        assert!(node.children.len() <= MAX_CHILDREN, "real recursion must stay capped at MAX_CHILDREN");
+    }
+
+    #[test]
+    fn recursion_never_exceeds_the_global_call_budget() {
+        let runner = FakeCommandRunner::new();
+        runner.respond("equery", ok(&wide_dependents_fixture()));
+        let mut visited = HashSet::new();
+        let calls_remaining = Cell::new(MAX_EQUERY_CALLS);
+        build_tree(&runner, "dev-libs/root-1.0", &HashSet::new(), MAX_DEPTH, &mut visited, &calls_remaining);
+        assert!(
+            runner.calls.borrow().len() <= MAX_EQUERY_CALLS as usize,
+            "a maximally-connected fixture (15 fan-out at every level) must still respect MAX_EQUERY_CALLS, \
+             the one bound that actually keeps this from running for an unbounded amount of time"
+        );
+    }
+
+    #[test]
+    fn recursion_never_exceeds_the_configured_depth() {
+        let runner = FakeCommandRunner::new();
+        runner.respond("equery", ok(&wide_dependents_fixture()));
+        let mut visited = HashSet::new();
+        let calls_remaining = Cell::new(MAX_EQUERY_CALLS);
+        let node = build_tree(&runner, "dev-libs/root-1.0", &HashSet::new(), MAX_DEPTH, &mut visited, &calls_remaining);
+        assert!(max_depth(&node) <= MAX_DEPTH + 1, "MAX_DEPTH levels of children below the root node");
+    }
+
+    #[test]
+    fn a_world_member_stops_recursion_immediately() {
+        let runner = FakeCommandRunner::new();
+        // Deliberately no response configured — if this were called, the
+        // test would fail with "no response configured", which is exactly
+        // the point: a @world node is the answer, not a link to follow,
+        // so `direct_dependents` must never run for it.
+        let mut visited = HashSet::new();
+        let calls_remaining = Cell::new(MAX_EQUERY_CALLS);
+        let world_atoms: HashSet<String> = ["dev-libs/root".to_string()].into_iter().collect();
+        let node = build_tree(&runner, "dev-libs/root-1.0", &world_atoms, MAX_DEPTH, &mut visited, &calls_remaining);
+        assert!(node.in_world);
+        assert!(node.children.is_empty());
+        assert!(runner.calls.borrow().is_empty());
     }
 }

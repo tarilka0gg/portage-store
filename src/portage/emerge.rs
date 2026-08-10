@@ -160,10 +160,22 @@ fn binpkg_args(getbinpkg: bool) -> Vec<String> {
     if getbinpkg { vec!["--getbinpkg".into()] } else { Vec::new() }
 }
 
+/// Appends `--buildpkg` when `buildpkg` is set — caches a local binary
+/// package of whatever gets merged (see `binpkg.rs`), so an older version
+/// stays available to reinstall later (`binpkg::downgrade_job`) without
+/// recompiling. Deliberately a per-job flag rather than a global
+/// `FEATURES=buildpkg` in `make.conf`: the latter would cache *every*
+/// merge forever with no way to scope it, growing `PKGDIR` unbounded for
+/// packages nobody will ever want to downgrade.
+fn buildpkg_args(buildpkg: bool) -> Vec<String> {
+    if buildpkg { vec!["--buildpkg".into()] } else { Vec::new() }
+}
+
 /// Installs/updates the given atom.
-pub fn install_job(atom: &str, getbinpkg: bool) -> Job {
+pub fn install_job(atom: &str, getbinpkg: bool, buildpkg: bool) -> Job {
     let mut args = vec!["--ask=n".into(), "--verbose".into()];
     args.extend(binpkg_args(getbinpkg));
+    args.extend(buildpkg_args(buildpkg));
     args.push(atom.into());
     Job { privileged: true, binary: "emerge".into(), args, jobs_override: None }
 }
@@ -172,9 +184,10 @@ pub fn install_job(atom: &str, getbinpkg: bool) -> Job {
 /// imported profile bundle's `@world` set, where "one emerge job per
 /// atom" would mean queuing (and separately confirming) potentially
 /// hundreds of jobs for what is really one logical operation.
-pub fn install_many_job(atoms: &[String], getbinpkg: bool) -> Job {
+pub fn install_many_job(atoms: &[String], getbinpkg: bool, buildpkg: bool) -> Job {
     let mut args = vec!["--ask=n".into(), "--verbose".into()];
     args.extend(binpkg_args(getbinpkg));
+    args.extend(buildpkg_args(buildpkg));
     args.extend(atoms.iter().cloned());
     Job { privileged: true, binary: "emerge".into(), args, jobs_override: None }
 }
@@ -189,37 +202,103 @@ pub fn pretend_install_job(atom: &str, getbinpkg: bool) -> Job {
     Job { privileged: false, binary: "emerge".into(), args, jobs_override: None }
 }
 
-/// In-memory cache of a `--pretend` run's raw output lines (plus whether it
-/// succeeded), keyed by atom and the exact version it was run against.
+/// Disk-backed cache of a `--pretend` run's raw output lines (plus whether
+/// it succeeded), keyed by atom and the exact version it was run against.
 /// `--pretend` does a full dependency resolution — often the single
 /// slowest thing this app does — and re-opening a detail page (or coming
 /// back to one already visited) re-ran it from scratch every time even
 /// though the answer for the same atom/version pair can't have changed
 /// since the last visit, absent the system's own installed packages or USE
-/// flags changing in between.
-type PretendCacheEntry = (String, bool, Vec<String>);
+/// flags changing in between. Backed by disk (not just memory) so that
+/// survives a restart too — reopening the app right after closing it
+/// shouldn't re-pay a resolution it just paid for.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PretendCacheEntry {
+    version: String,
+    success: bool,
+    lines: Vec<String>,
+    stored_unix_time: u64,
+}
+
+/// A safety net, not the primary invalidation path — a sync
+/// (`invalidate on sync`, see `ui::queue::start_next`) is the actual event
+/// that can change a `--pretend` answer, and clears the whole cache
+/// outright. This bounds how stale an entry can get from anything *else*
+/// that might shift dependency resolution outside this app's own view
+/// (system packages changed from outside it, e.g. a terminal `emerge`).
+const PRETEND_CACHE_TTL_SECONDS: u64 = 60 * 60;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn pretend_cache_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    let dir = base.join("portage-store");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("pretend_cache.json"))
+}
+
+fn load_pretend_cache_from_disk() -> std::collections::HashMap<String, PretendCacheEntry> {
+    let Some(path) = pretend_cache_path() else { return std::collections::HashMap::new() };
+    let Ok(text) = std::fs::read_to_string(path) else { return std::collections::HashMap::new() };
+    let entries: std::collections::HashMap<String, PretendCacheEntry> = serde_json::from_str(&text).unwrap_or_default();
+    let now = unix_now();
+    entries.into_iter().filter(|(_, e)| now.saturating_sub(e.stored_unix_time) < PRETEND_CACHE_TTL_SECONDS).collect()
+}
+
+fn persist_pretend_cache(cache: &std::collections::HashMap<String, PretendCacheEntry>) {
+    let Some(path) = pretend_cache_path() else { return };
+    if let Ok(text) = serde_json::to_string(cache) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 fn pretend_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, PretendCacheEntry>> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PretendCacheEntry>>> =
         std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    CACHE.get_or_init(|| std::sync::Mutex::new(load_pretend_cache_from_disk()))
 }
 
 /// Returns the cached `--pretend` result for `atom`, if it was last run
-/// against exactly `version` — a version bump (or downgrade) invalidates
-/// it, since the dependency graph, download size, and USE requirements can
-/// all be completely different for a different version. Returns
-/// `(success, lines)`.
+/// against exactly `version` within the last `PRETEND_CACHE_TTL_SECONDS` —
+/// a version bump (or downgrade) invalidates it, since the dependency
+/// graph, download size, and USE requirements can all be completely
+/// different for a different version. Returns `(success, lines)`.
 pub fn cached_pretend(atom: &str, version: &str) -> Option<(bool, Vec<String>)> {
     let cache = pretend_cache().lock().unwrap();
-    let (cached_version, success, lines) = cache.get(atom)?;
-    (cached_version == version).then(|| (*success, lines.clone()))
+    let entry = cache.get(atom)?;
+    if entry.version != version || unix_now().saturating_sub(entry.stored_unix_time) >= PRETEND_CACHE_TTL_SECONDS {
+        return None;
+    }
+    Some((entry.success, entry.lines.clone()))
 }
 
 pub fn store_pretend(atom: &str, version: &str, success: bool, lines: Vec<String>) {
-    pretend_cache()
-        .lock()
-        .unwrap()
-        .insert(atom.to_string(), (version.to_string(), success, lines));
+    let mut cache = pretend_cache().lock().unwrap();
+    cache.insert(atom.to_string(), PretendCacheEntry { version: version.to_string(), success, lines, stored_unix_time: unix_now() });
+    persist_pretend_cache(&cache);
+}
+
+/// Drops any cached `--pretend` result for `atom` — used when something
+/// that would change the answer just happened outside of a version bump
+/// (a USE flag flip), so the next lookup re-runs the resolver instead of
+/// serving a now-stale cached result for the same atom/version pair.
+pub fn invalidate_pretend(atom: &str) {
+    let mut cache = pretend_cache().lock().unwrap();
+    cache.remove(atom);
+    persist_pretend_cache(&cache);
+}
+
+/// Drops every cached `--pretend` result — called once a sync completes,
+/// since a sync can change the dependency graph for anything in the tree,
+/// not just the one atom a USE-flag change (`invalidate_pretend`) affects.
+pub fn clear_pretend_cache() {
+    let mut cache = pretend_cache().lock().unwrap();
+    cache.clear();
+    persist_pretend_cache(&cache);
 }
 
 /// Whether pinning to this exact version resolves cleanly — no unmet
@@ -272,6 +351,25 @@ pub fn parse_pretend_output(lines: &[String]) -> InstallPreview {
         }
     }
     preview
+}
+
+/// Pulls the bare `category/name-version` atoms out of `emerge --pretend`
+/// output lines, which look like `[ebuild   U  ] cat/name-1.2 [1.1]
+/// USE="..."` — the "what's pending" list itself, as opposed to
+/// `parse_pretend_output`'s totals-only summary.
+pub fn parse_update_atoms(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("[ebuild") && !trimmed.starts_with("[binary") {
+                return None;
+            }
+            let after_bracket = trimmed.split_once(']')?.1.trim();
+            let atom_with_version = after_bracket.split_whitespace().next()?;
+            Some(atom_with_version.to_string())
+        })
+        .collect()
 }
 
 /// One line of `--pretend --verbose` output, broken down to a single
@@ -344,6 +442,14 @@ const TOOLCHAIN_ATOMS: &[&str] =
 /// just a compile-from-source one.
 pub fn touches_toolchain(pending: &[PendingPackage]) -> Option<&'static str> {
     pending.iter().find_map(|pkg| TOOLCHAIN_ATOMS.iter().find(|&&atom| atom == pkg.atom).copied())
+}
+
+/// As `touches_toolchain`, but against a bare atom list rather than full
+/// `PendingPackage` data — for a pre-flight check at the moment "Update
+/// All" is clicked, when only `known_atoms` (the atom list, not a fresh
+/// `--pretend` run's parsed output) is available yet.
+pub fn atoms_touch_toolchain(atoms: &[String]) -> Option<&'static str> {
+    atoms.iter().find_map(|atom| TOOLCHAIN_ATOMS.iter().find(|&&t| t == atom).copied())
 }
 
 /// Splits a `name-version` token (already stripped of its `category/`
@@ -860,6 +966,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invalidating_a_cached_pretend_clears_it() {
+        store_pretend("dev-test/invalidate-me", "1.0", true, vec!["line".to_string()]);
+        assert!(cached_pretend("dev-test/invalidate-me", "1.0").is_some());
+        invalidate_pretend("dev-test/invalidate-me");
+        assert!(cached_pretend("dev-test/invalidate-me", "1.0").is_none());
+    }
+
+    #[test]
     fn privileged_jobs_render_with_doas_priv_helper_run_first() {
         let job = Job {
             privileged: true,
@@ -1325,5 +1439,17 @@ mod tests {
         let lines = vec![r#"[ebuild   R    ] app-editors/neovim-0.10.0::gentoo  120 KiB"#.to_string()];
         let packages = parse_pretend_packages(&lines);
         assert_eq!(touches_toolchain(&packages), None);
+    }
+
+    #[test]
+    fn atoms_touch_toolchain_matches_a_bare_atom_list() {
+        let atoms = vec!["app-editors/neovim".to_string(), "sys-libs/glibc".to_string()];
+        assert_eq!(atoms_touch_toolchain(&atoms), Some("sys-libs/glibc"));
+    }
+
+    #[test]
+    fn atoms_touch_toolchain_is_none_for_an_ordinary_list() {
+        let atoms = vec!["app-editors/neovim".to_string()];
+        assert_eq!(atoms_touch_toolchain(&atoms), None);
     }
 }

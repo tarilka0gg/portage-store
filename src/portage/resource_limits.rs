@@ -6,7 +6,7 @@ use super::emerge::Job;
 /// development — an unthrottled `-j24` build exhausted RAM and the
 /// kernel's OOM killer took out unrelated processes (the user's browser,
 /// Steam) along with the build itself.
-const RAM_PER_JOB_KIB: u64 = 2 * 1024 * 1024;
+pub const RAM_PER_JOB_KIB: u64 = 2 * 1024 * 1024;
 
 pub fn cpu_cores() -> u32 {
     std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1)

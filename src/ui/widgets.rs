@@ -1,6 +1,6 @@
-use crate::portage::eix::PackageSummary;
-use crate::portage::icons;
-use crate::portage::installed::InstalledPackage;
+use portage_store::portage::eix::PackageSummary;
+use portage_store::portage::icons;
+use portage_store::portage::installed::InstalledPackage;
 use adw::prelude::*;
 use std::collections::HashMap;
 
@@ -466,7 +466,7 @@ pub fn package_card(
 /// Flatpak build exists when the merge wasn't sure enough to say so.
 pub fn add_flatpak_chip(card: &gtk::Button) {
     let Some(row) = card.child().and_downcast::<gtk::Box>() else { return };
-    let chip = gtk::Label::new(Some(&format!("Also on {}", crate::backend::SourceId::Flatpak.label())));
+    let chip = gtk::Label::new(Some(&format!("Also on {}", portage_store::backend::SourceId::Flatpak.label())));
     chip.add_css_class("source-chip");
     chip.set_valign(gtk::Align::Center);
     row.insert_child_after(&chip, row.last_child().as_ref());
@@ -478,10 +478,10 @@ pub fn add_flatpak_chip(card: &gtk::Button) {
 /// card: this section is meant to read as a secondary, optional list
 /// tucked below the real (Portage) results, not visually competing with
 /// them for attention.
-pub fn flatpak_only_row(app: &crate::flatpak::FlatpakApp, already_installed: bool) -> adw::ActionRow {
+pub fn flatpak_only_row(app: &portage_store::flatpak::FlatpakApp, already_installed: bool) -> adw::ActionRow {
     let row = adw::ActionRow::builder().title(&app.name).subtitle(&app.description).build();
     row.add_prefix(&gtk::Image::from_icon_name("package-x-generic-symbolic"));
-    let chip_text = if already_installed { "Installed".to_string() } else { crate::backend::SourceId::Flatpak.label().to_string() };
+    let chip_text = if already_installed { "Installed".to_string() } else { portage_store::backend::SourceId::Flatpak.label().to_string() };
     let chip = gtk::Label::new(Some(&chip_text));
     chip.add_css_class("source-chip");
     chip.set_valign(gtk::Align::Center);

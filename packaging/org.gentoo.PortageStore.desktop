@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Portage Store
+GenericName=Package Manager
+Comment=Search, install, and manage Gentoo packages
+Exec=portage-store
+Icon=org.gentoo.PortageStore
+Terminal=false
+Categories=System;PackageManager;GTK;
+StartupNotify=true
+StartupWMClass=portage-store

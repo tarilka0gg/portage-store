@@ -1,4 +1,4 @@
-use crate::portage::config_protect::{self, DiffSegment, PendingUpdate};
+use portage_store::portage::config_protect::{self, DiffSegment, PendingUpdate};
 use crate::ui::runtime;
 use adw::prelude::*;
 use std::cell::Cell;

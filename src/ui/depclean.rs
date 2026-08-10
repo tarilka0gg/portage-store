@@ -1,5 +1,5 @@
 use super::{App, QueueEntry};
-use crate::portage::depclean;
+use portage_store::portage::depclean;
 use crate::ui::runtime;
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};

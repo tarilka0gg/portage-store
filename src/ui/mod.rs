@@ -1,27 +1,40 @@
+mod audit_log_page;
+mod blocker_dialog;
+mod browse;
 mod build_failure;
+mod build_log_history;
+mod checks;
 mod cleanup;
 mod config_update;
 mod depclean;
 mod detail;
+mod flatpak_lane;
 mod health;
+mod kernel_page;
+mod log_drawer;
 mod news;
 mod onboarding;
 mod why_installed;
 mod preferences;
+mod presets;
+mod profile_switch;
+mod queue;
 mod runtime;
 mod settings;
 mod webview;
 mod widgets;
 
-use crate::backend;
-use crate::flatpak;
-use crate::portage::eix::{self, PackageSummary};
-use crate::portage::emerge::{self, Job};
-use crate::portage::config_protect::PendingUpdate;
-use crate::portage::installed::{self, InstalledPackage};
-use crate::portage::icons;
-use crate::portage::news::NewsItem;
-use crate::portage::package_use;
+use portage_store::backend;
+use portage_store::flatpak;
+use portage_store::portage::eix::{self, PackageSummary};
+use portage_store::portage::emerge::{self, Job};
+use portage_store::portage::config_protect::PendingUpdate;
+use portage_store::portage::installed::{self, InstalledPackage};
+use portage_store::portage::icons;
+use portage_store::portage::news::NewsItem;
+use portage_store::portage::package_use;
+use portage_store::portage::search_query;
+use portage_store::portage::world;
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -206,13 +219,13 @@ impl PendingRelaxation {
             }
             Self::Keyword(changes) => {
                 for (atom, keyword) in changes {
-                    crate::portage::package_keywords::accept(atom, keyword)?;
+                    portage_store::portage::package_keywords::accept(atom, keyword)?;
                 }
             }
             Self::License(changes) => {
                 for (atom, licenses) in changes {
                     for license in licenses {
-                        crate::portage::package_license::accept(atom, license)?;
+                        portage_store::portage::package_license::accept(atom, license)?;
                     }
                 }
             }
@@ -251,6 +264,16 @@ pub struct App {
     /// instantly (`render_filtered_results`) without re-running `eix`.
     last_results: RefCell<Vec<eix::PackageSummary>>,
     search_filters: RefCell<eix::SearchFilters>,
+    /// From the search box's own `use:<flag>`/`installed:` operators (see
+    /// `portage::search_query`) — kept separate from `search_filters`
+    /// rather than folded into it, since the filter popover
+    /// (`build_filter_popover`) always rewrites `search_filters` wholesale
+    /// from its own widget state, which would silently clobber whatever a
+    /// typed operator set. Applied as an extra pass in
+    /// `render_filtered_results`, reset on every new search/category
+    /// browse so a stale operator from a previous query doesn't linger.
+    search_query_use_flag: RefCell<Option<String>>,
+    search_query_installed_only: Cell<Option<bool>>,
     /// Whether the Flatpak backend is even worth asking — `flatpak.rs`'s
     /// own auto-detection (binary present, at least one remote), checked
     /// once at startup rather than on every keystroke.
@@ -329,11 +352,23 @@ pub struct App {
     job_log: gtk::Label,
     job_progress: gtk::ProgressBar,
     job_eta: gtk::Label,
+    job_queue_eta: gtk::Label,
+    job_run_now_button: gtk::Button,
 
     installed: RefCell<HashMap<String, InstalledPackage>>,
     icon_paths: RefCell<HashMap<String, PathBuf>>,
     queue: RefCell<VecDeque<QueueEntry>>,
     running: Cell<bool>,
+    /// The cookie from `GtkApplication::inhibit`, held for exactly as long
+    /// as either job lane is running — see `sync_inhibit`. `None` means
+    /// nothing is currently inhibited.
+    inhibit_cookie: Cell<Option<u32>>,
+    /// Set right before a one-shot `start_next()` call that should ignore
+    /// `night_builds_only`'s off-hours gate — see the "Build Now" button
+    /// wired to the night-window deferral state. Consumed (reset to
+    /// `false`) the moment it's read, via `Cell::take()`, so it never
+    /// persists past the single call it was set for.
+    force_run_next: Cell<bool>,
     /// Bumped per search so results from an overtaken keystroke get dropped
     /// instead of clobbering newer ones.
     search_generation: Cell<u64>,
@@ -377,25 +412,9 @@ fn scan_installed() -> HashMap<String, InstalledPackage> {
         .collect()
 }
 
-/// Pulls the atoms out of `emerge --pretend` output lines, which look like
-/// `[ebuild   U  ] cat/name-1.2 [1.1] USE="..."`.
-fn parse_update_atoms(lines: &[String]) -> Vec<String> {
-    lines
-        .iter()
-        .filter_map(|line| {
-            let trimmed = line.trim_start();
-            if !trimmed.starts_with("[ebuild") && !trimmed.starts_with("[binary") {
-                return None;
-            }
-            let after_bracket = trimmed.split_once(']')?.1.trim();
-            let atom_with_version = after_bracket.split_whitespace().next()?;
-            Some(atom_with_version.to_string())
-        })
-        .collect()
-}
-
 /// Strips the trailing `-<version>` off a `category/name-version` string
-/// (as `parse_update_atoms` returns) to get the bare atom `emerge` expects
+/// (as `emerge::parse_update_atoms` returns) to get the bare atom `emerge`
+/// expects
 /// for an unpinned "install the latest version" invocation — the same
 /// "last `-` followed by a digit" rule `installed::split_pf` uses to split
 /// a `PF` directory name, applied here to the category/name half only.
@@ -410,6 +429,54 @@ fn strip_version_suffix(atom_with_version: &str) -> String {
         }
     }
     atom_with_version.to_string()
+}
+
+/// Runs whatever `eix` call(s) a parsed search-box query actually needs —
+/// the routing logic behind the `cat:`/`@world` operators (`use:` and
+/// `installed:` don't change which `eix` call runs at all; they're applied
+/// afterward as in-memory filters, see `render_filtered_results`).
+///
+/// - `@world` with no other text: resolves every `world::read()` atom via
+///   `eix::lookup` — world sets are realistically tens to a couple hundred
+///   entries, the same cost class as a normal free-text search.
+/// - `@world` combined with text: runs the normal search, then keeps only
+///   atoms that are also in the world set.
+/// - `cat:<name>` with no other text: `eix::list_categories(&[name])`
+///   directly — the exact primitive `browse_category` already uses for its
+///   curated category tiles, just fed a user-typed name instead.
+/// - `cat:<name>` combined with text: runs the normal search, then keeps
+///   only that category (`cat:` narrows an otherwise-normal search rather
+///   than replacing it, matching how `use:`/`installed:` behave).
+/// - Neither operator: unchanged, `eix::search(text)`.
+fn resolve_search(parsed: &search_query::ParsedQuery) -> Result<Vec<PackageSummary>, String> {
+    let text = parsed.text.trim();
+
+    let mut results = if parsed.world_only && text.is_empty() {
+        let atoms = world::read().map_err(|e| e.to_string())?;
+        atoms.into_iter().filter_map(|atom| eix::lookup(&atom).ok().flatten()).collect()
+    } else if let Some(category) = &parsed.category
+        && text.is_empty()
+    {
+        eix::list_categories(&[category.as_str()]).map_err(|e| e.to_string())?
+    } else if text.is_empty() {
+        // An operator with no value and no free text (`cat:`/`use:` alone
+        // with nothing else typed) — nothing to search for.
+        Vec::new()
+    } else {
+        eix::search(text).map_err(|e| e.to_string())?
+    };
+
+    if parsed.world_only && !text.is_empty() {
+        let world_atoms: std::collections::HashSet<String> = world::read().map_err(|e| e.to_string())?.into_iter().collect();
+        results.retain(|pkg| world_atoms.contains(&pkg.atom()));
+    }
+    if let Some(category) = &parsed.category
+        && !text.is_empty()
+    {
+        results.retain(|pkg| &pkg.category == category);
+    }
+
+    Ok(results)
 }
 
 const NIGHT_WINDOW_START_HOUR: i32 = 23;
@@ -912,6 +979,7 @@ impl App {
         advanced_menu.append(Some("Throttle Builds (nice/ionice + MAKEOPTS)"), Some("win.throttle-builds"));
         advanced_menu.append(Some("Collect at Night Only"), Some("win.night-builds-only"));
         advanced_menu.append(Some("Periodic Health Checks"), Some("win.periodic-health-checks"));
+        advanced_menu.append(Some("Cache Binary Packages on Install"), Some("win.buildpkg-on-install"));
 
         let maintenance_menu = gtk::gio::Menu::new();
         maintenance_menu.append(Some("System Health"), Some("win.health"));
@@ -919,6 +987,7 @@ impl App {
         maintenance_menu.append(Some("Free Up Space"), Some("win.cleanup"));
         maintenance_menu.append(Some("Remove Orphaned Packages"), Some("win.depclean"));
         maintenance_menu.append(Some("Setup Wizard"), Some("win.onboarding"));
+        maintenance_menu.append(Some("Package Presets"), Some("win.presets"));
 
         let menu = gtk::gio::Menu::new();
         menu.append_submenu(Some("Maintenance"), &maintenance_menu);
@@ -984,11 +1053,23 @@ impl App {
         job_eta.add_css_class("caption");
         job_eta.set_visible(false);
 
+        // Separate from `job_eta` (which is scoped to the one job actually
+        // running) — this sums whatever's left in `queue` behind it, so
+        // "walking away for the night" has one number for the whole
+        // backlog, not just whatever happens to be running first. Hidden
+        // whenever nothing queued has any build history to estimate from.
+        let job_queue_eta = gtk::Label::new(None);
+        job_queue_eta.set_xalign(0.0);
+        job_queue_eta.add_css_class("dim-label");
+        job_queue_eta.add_css_class("caption");
+        job_queue_eta.set_visible(false);
+
         let job_text = gtk::Box::new(gtk::Orientation::Vertical, 2);
         job_text.set_hexpand(true);
         job_text.append(&job_label);
         job_text.append(&job_progress);
         job_text.append(&job_eta);
+        job_text.append(&job_queue_eta);
         job_text.append(&job_log);
 
         // Opens a popover listing everything waiting behind the current
@@ -999,6 +1080,17 @@ impl App {
         queue_button.add_css_class("flat");
         queue_button.set_valign(gtk::Align::Center);
         queue_button.set_tooltip_text(Some("View queued jobs"));
+
+        // Shown only while a job is sitting out `night_builds_only`'s
+        // off-hours window (see `start_next`'s deferral branch) — the
+        // override for "actually, run it now," wired once `app` exists.
+        // Hidden the rest of the time rather than always present and
+        // disabled, since it does nothing outside that one state.
+        let job_run_now_button = gtk::Button::with_label("Build Now");
+        job_run_now_button.add_css_class("flat");
+        job_run_now_button.set_valign(gtk::Align::Center);
+        job_run_now_button.set_tooltip_text(Some("Skip the night-hours wait and start now"));
+        job_run_now_button.set_visible(false);
 
         // Wrapped in a flat, chrome-free button rather than a bare click
         // gesture on the box — same visible layout, but gets hover/press
@@ -1017,6 +1109,7 @@ impl App {
         job_box.set_margin_end(14);
         job_box.append(&job_spinner);
         job_box.append(&job_text_button);
+        job_box.append(&job_run_now_button);
         job_box.append(&queue_button);
 
         let job_revealer = gtk::Revealer::builder().child(&job_box).build();
@@ -1082,6 +1175,15 @@ impl App {
         log_errors_only.add_css_class("flat");
         log_errors_only.set_tooltip_text(Some("Hide everything except lines that look like an actual error"));
 
+        // Opens the persisted, phase-collapsed, searchable log history
+        // (`build_log_history.rs`) — a *past* job's output, distinct from
+        // this drawer, which only ever shows the currently-running (or
+        // just-finished) job's live tail.
+        let log_history_button = gtk::Button::from_icon_name("document-open-recent-symbolic");
+        log_history_button.add_css_class("flat");
+        log_history_button.set_tooltip_text(Some("Past builds"));
+        log_history_button.connect_clicked(|button| build_log_history::present(button));
+
         let log_close_button = gtk::Button::from_icon_name("go-down-symbolic");
         log_close_button.add_css_class("flat");
         log_close_button.set_tooltip_text(Some("Close"));
@@ -1096,6 +1198,7 @@ impl App {
         log_header_title.set_xalign(0.0);
         log_header.append(&log_header_title);
         log_header.append(&log_errors_only);
+        log_header.append(&log_history_button);
         log_header.append(&log_close_button);
 
         let log_column = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -1253,6 +1356,8 @@ impl App {
             filter_button,
             last_results: RefCell::new(Vec::new()),
             search_filters: RefCell::new(eix::SearchFilters::default()),
+            search_query_use_flag: RefCell::new(None),
+            search_query_installed_only: Cell::new(None),
             flatpak_available: Cell::new(false),
             search_cards: RefCell::new(HashMap::new()),
             flatpak_section,
@@ -1289,10 +1394,14 @@ impl App {
             job_log,
             job_progress,
             job_eta,
+            job_queue_eta,
+            job_run_now_button,
             installed: RefCell::new(HashMap::new()),
             icon_paths: RefCell::new(HashMap::new()),
             queue: RefCell::new(VecDeque::new()),
             running: Cell::new(false),
+            inhibit_cookie: Cell::new(None),
+            force_run_next: Cell::new(false),
             search_generation: Cell::new(0),
             search_debounce: Cell::new(0),
             updates_generation: Cell::new(0),
@@ -1320,7 +1429,7 @@ impl App {
             let app_for_click = app.clone();
             app.sync_banner.connect_button_clicked(move |_| {
                 app_for_click.enqueue(QueueEntry {
-                    job: crate::portage::sync::sync_job(),
+                    job: portage_store::portage::sync::sync_job(),
                     label: "Syncing package tree".to_string(),
                     // Not a package install, but a sync genuinely changes
                     // what "up to date" means — reusing the same
@@ -1336,6 +1445,13 @@ impl App {
         {
             let app_for_click = app.clone();
             queue_button.connect_clicked(move |button| app_for_click.present_queue_popover(button));
+        }
+        {
+            let app_for_click = app.clone();
+            app.job_run_now_button.connect_clicked(move |_| {
+                app_for_click.force_run_next.set(true);
+                app_for_click.start_next();
+            });
         }
         {
             let app_for_click = app.clone();
@@ -1560,6 +1676,20 @@ impl App {
         });
         self.window.add_action(&periodic_health_checks);
 
+        let buildpkg_on_install = gtk::gio::SimpleAction::new_stateful(
+            "buildpkg-on-install",
+            None,
+            &self.settings.borrow().buildpkg_on_install.to_variant(),
+        );
+        let app = self.clone();
+        buildpkg_on_install.connect_activate(move |action, _| {
+            let enabled = !action.state().and_then(|v| v.get::<bool>()).unwrap_or(false);
+            action.set_state(&enabled.to_variant());
+            app.settings.borrow_mut().buildpkg_on_install = enabled;
+            settings::save(&app.settings.borrow());
+        });
+        self.window.add_action(&buildpkg_on_install);
+
         let health = gtk::gio::SimpleAction::new("health", None);
         let app = self.clone();
         health.connect_activate(move |_, _| health::present(&app));
@@ -1569,7 +1699,7 @@ impl App {
         let app = self.clone();
         sync.connect_activate(move |_, _| {
             app.enqueue(QueueEntry {
-                job: crate::portage::sync::sync_job(),
+                job: portage_store::portage::sync::sync_job(),
                 label: "Syncing package tree".to_string(),
                 mutating: true,
                 retry_with_use_fix: false,
@@ -1599,6 +1729,11 @@ impl App {
             onboarding::present(&app, on_dismissed);
         });
         self.window.add_action(&onboarding_action);
+
+        let presets_action = gtk::gio::SimpleAction::new("presets", None);
+        let app = self.clone();
+        presets_action.connect_activate(move |_, _| presets::present(&app));
+        self.window.add_action(&presets_action);
     }
 
     fn connect_signals(
@@ -1641,21 +1776,29 @@ impl App {
         });
 
         let app = self.clone();
-        update_all.connect_clicked(move |_| {
-            app.enqueue(QueueEntry {
-                job: emerge::update_world_job(app.settings.borrow().prefer_binary_packages),
-                label: "System update (@world)".to_string(),
-                mutating: true,
-                // A `--deep --newuse @world` update is at least as likely
-                // to hit a required-USE/keyword/license mismatch or a
-                // circular dependency as a single-package install — there
-                // was no reason this was off here specifically, and
-                // leaving it off meant the same auto-fix dialog a single
-                // install already gets never showed up for the one job
-                // most likely to actually need it.
-                retry_with_use_fix: true,
-                known_atoms: app.pending_update_atoms.borrow().clone(),
+        update_all.connect_clicked(move |button| {
+            let warnings = app.preflight_warnings();
+            if warnings.is_empty() {
+                app.start_update_all();
+                return;
+            }
+            let Some(window) = button.root().and_downcast::<gtk::Window>() else {
+                return;
+            };
+            let body = warnings.join("\n\n");
+            let dialog = adw::AlertDialog::new(Some("Before You Start"), Some(&body));
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("continue", "Continue");
+            dialog.set_response_appearance("continue", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let app = app.clone();
+            dialog.connect_response(None, move |_, response| {
+                if response == "continue" {
+                    app.start_update_all();
+                }
             });
+            dialog.present(Some(&window));
         });
 
         let app = self.clone();
@@ -1853,8 +1996,8 @@ impl App {
                         move |tx| {
                             for name in names {
                                 let path = (|| {
-                                    let app = crate::portage::flathub::lookup(&name)?;
-                                    crate::portage::media::fetch(&app.icon?)
+                                    let app = portage_store::portage::flathub::lookup(&name)?;
+                                    portage_store::portage::media::fetch(&app.icon?)
                                 })();
                                 if tx.send_blocking((name, path)).is_err() {
                                     break;
@@ -1937,6 +2080,7 @@ impl App {
                 iuse: Vec::new(),
                 masked: false,
                 overlay: None,
+                slot: None,
             };
             let (card, _icon) = widgets::package_card(&summary, &installed, &icons);
             self.connect_card(&card, summary);
@@ -1954,6 +2098,7 @@ impl App {
                 iuse: Vec::new(),
                 masked: false,
                 overlay: None,
+                slot: None,
             };
             let (card, _icon) = widgets::package_card(&summary, &installed, &icons);
             self.connect_card(&card, summary);
@@ -1968,1468 +2113,25 @@ impl App {
         self.scroll_to_top();
     }
 
-    fn check_updates(self: &Rc<Self>) {
-        self.updates_stack.set_visible_child_name("checking");
-        self.updates_generation.set(self.updates_generation.get() + 1);
-        let generation = self.updates_generation.get();
-        let lines: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let collect = lines.clone();
-        let app = self.clone();
-        runtime::spawn_job(
-            emerge::pretend_world_job(self.settings.borrow().prefer_binary_packages),
-            move |line| collect.borrow_mut().push(line),
-            move |_success| {
-                // An overtaken check (a newer one started after this one)
-                // finishing late must not clobber the newer, more
-                // accurate result with what could easily be stale
-                // pre-update data.
-                if generation != app.updates_generation.get() {
-                    return;
-                }
-                let atoms = parse_update_atoms(&lines.borrow());
-                let download_kib = emerge::parse_pretend_output(&lines.borrow()).download_kib;
-                app.show_updates(atoms, download_kib);
-            },
-        );
-    }
 
-    /// Checks for unread Gentoo news (GLEP-42 items — profile migrations,
-    /// dropped defaults, anything portage itself would print a "N news
-    /// items need reading" reminder about) and reveals `news_banner` if
-    /// there are any. Re-run on startup and on manual refresh; unlike
-    /// updates, nothing else in this app changes what's unread, so there's
-    /// no reason to also re-check after a job finishes.
-    fn check_news(self: &Rc<Self>) {
-        let app = self.clone();
-        runtime::spawn_blocking(
-            crate::portage::news::list,
-            move |result| {
-                let items = result.unwrap_or_default();
-                let unread = items.iter().filter(|i| i.unread).count();
-                *app.news_items.borrow_mut() = items;
-                if unread == 0 {
-                    app.news_banner.set_revealed(false);
-                    return;
-                }
-                app.news_banner.set_title(&if unread == 1 {
-                    "1 Gentoo news item to read".to_string()
-                } else {
-                    format!("{unread} Gentoo news items to read")
-                });
-                app.news_banner.set_revealed(true);
-            },
-        );
-    }
 
-    /// Scans every `CONFIG_PROTECT` root for pending `._cfgNNNN_name`
-    /// files — updates portage wrote beside a config file it wouldn't
-    /// overwrite in place — and reveals `config_protect_banner` if there
-    /// are any. Re-run on startup, manual refresh, and after any
-    /// mutating job succeeds, since that's exactly when new ones show up.
-    fn check_config_protect(self: &Rc<Self>) {
-        let app = self.clone();
-        runtime::spawn_blocking(crate::portage::config_protect::scan, move |items| {
-            let count = items.len();
-            *app.config_protect_items.borrow_mut() = items;
-            if count == 0 {
-                app.config_protect_banner.set_revealed(false);
-                return;
-            }
-            app.config_protect_banner.set_title(&if count == 1 {
-                "1 config file needs review".to_string()
-            } else {
-                format!("{count} config files need review")
-            });
-            app.config_protect_banner.set_revealed(true);
-        });
-    }
 
-    /// Checks `glsa-check` for security advisories affecting what's
-    /// actually installed — a category no default Gentoo install surfaces
-    /// anywhere without already knowing `app-portage/gentoolkit`'s
-    /// `glsa-check` exists. Shown as its own section above the ordinary
-    /// update list, plus a badge on the Updates tab itself so it's
-    /// visible without opening the tab at all.
-    fn check_glsa(self: &Rc<Self>) {
-        let app = self.clone();
-        runtime::spawn_blocking(crate::portage::glsa::list_affected, move |result| {
-            let entries = result.unwrap_or_default();
 
-            while let Some(row) = app.security_list.first_child() {
-                app.security_list.remove(&row);
-            }
 
-            if entries.is_empty() {
-                app.security_section.set_visible(false);
-                app.updates_view_page.set_badge_number(0);
-                app.updates_view_page.set_needs_attention(false);
-                return;
-            }
 
-            app.updates_view_page.set_badge_number(entries.len() as u32);
-            app.updates_view_page.set_needs_attention(true);
-            app.security_section.set_visible(true);
 
-            for entry in entries {
-                let row = adw::ActionRow::builder()
-                    .title(format!("{} — {}", entry.id, entry.description))
-                    .subtitle(entry.packages.join(", "))
-                    .build();
-                row.add_prefix(&gtk::Image::from_icon_name("security-high-symbolic"));
 
-                let update_button = gtk::Button::with_label("Update");
-                update_button.add_css_class("destructive-action");
-                update_button.set_valign(gtk::Align::Center);
-                let app_for_click = app.clone();
-                let packages = entry.packages.clone();
-                update_button.connect_clicked(move |button| {
-                    button.set_sensitive(false);
-                    for atom in &packages {
-                        app_for_click.enqueue(QueueEntry {
-                            job: emerge::install_job(atom, app_for_click.settings.borrow().prefer_binary_packages),
-                            label: format!("Security update: {atom}"),
-                            mutating: true,
-                            retry_with_use_fix: true,
-                            known_atoms: Vec::new(),
-                        });
-                    }
-                });
-                row.add_suffix(&update_button);
 
-                app.security_list.append(&row);
-            }
-        });
-    }
 
-    /// How stale the tree can get before "Updates" is answering from
-    /// data old enough to be actively misleading — a week is a
-    /// commonly-cited rule of thumb for how often Gentoo's own
-    /// documentation suggests syncing, not an arbitrary number.
-    const STALE_SYNC_SECONDS: u64 = 7 * 24 * 60 * 60;
 
-    fn check_sync(self: &Rc<Self>) {
-        let app = self.clone();
-        runtime::spawn_blocking(crate::portage::sync::seconds_since_last_sync, move |age| {
-            match age {
-                Some(seconds) if seconds >= Self::STALE_SYNC_SECONDS => {
-                    app.sync_banner.set_title(&format!(
-                        "Package tree last synced {} — \"Updates\" may be out of date",
-                        crate::portage::sync::format_age(seconds)
-                    ));
-                    app.sync_banner.set_revealed(true);
-                }
-                _ => app.sync_banner.set_revealed(false),
-            }
-        });
-    }
 
-    /// The opt-in "collect trend history without needing to open the
-    /// health dashboard" path — refreshes the same four visible signals
-    /// (news banner, config banner, GLSA badge, orphan count) the
-    /// dashboard's own checks already produce, and records one joint
-    /// snapshot to `health_history` so "pending N days" has data to work
-    /// from even for someone who never opens the dashboard itself.
-    /// Read-only end to end, so unlike a build job there's no reason to
-    /// gate this to `night_builds_only`'s off-hours window.
-    fn run_periodic_health_check(self: &Rc<Self>) {
-        self.check_news();
-        self.check_config_protect();
-        self.check_glsa();
-        self.check_sync();
 
-        runtime::spawn_blocking(
-            move || {
-                let unread_news =
-                    crate::portage::news::list().map(|items| items.iter().filter(|i| i.unread).count()).unwrap_or(0);
-                let pending_config = crate::portage::config_protect::scan().len();
-                let glsa_count = crate::portage::glsa::list_affected().map(|entries| entries.len()).unwrap_or(0);
-                // Shelled out directly rather than through the job queue
-                // (`depclean::pretend_job`) — this only needs a final
-                // parsed count, not live streamed progress, so the
-                // simpler synchronous call is enough.
-                let orphan_count = std::process::Command::new("emerge")
-                    .args(["--pretend", "--depclean"])
-                    .output()
-                    .ok()
-                    .map(|output| {
-                        let lines: Vec<String> =
-                            String::from_utf8_lossy(&output.stdout).lines().map(String::from).collect();
-                        if crate::portage::depclean::needs_update_first(&lines) {
-                            None
-                        } else {
-                            Some(crate::portage::depclean::parse_candidates(&lines).len())
-                        }
-                    })
-                    .unwrap_or(None);
-                (unread_news, pending_config, glsa_count, orphan_count)
-            },
-            move |(unread_news, pending_config, glsa_count, orphan_count)| {
-                // A `None` orphan count (couldn't measure it — needs a
-                // full update first) skips recording entirely, same as
-                // the dashboard's own joint-snapshot logic: 0 would
-                // misreport an unmeasured state as a resolved one.
-                if let Some(orphan_count) = orphan_count {
-                    crate::portage::health_history::record(unread_news, pending_config, glsa_count, orphan_count);
-                }
-            },
-        );
-    }
 
-    fn show_updates(self: &Rc<Self>, atoms: Vec<String>, download_kib: Option<u64>) {
-        while let Some(row) = self.updates_list.first_child() {
-            self.updates_list.remove(&row);
-        }
-        // Kept around for "Update All" to hand off as `known_atoms` — the
-        // one place in the app that already has the full pending-update
-        // atom list on hand before the job that would need it even
-        // starts, letting it show a real upfront ETA instead of none.
-        *self.pending_update_atoms.borrow_mut() = atoms.clone();
-        if atoms.is_empty() {
-            self.updates_stack.set_visible_child_name("uptodate");
-            return;
-        }
-        self.updates_subtitle
-            .set_text(&format!("{} packages will be updated", atoms.len()));
 
-        match download_kib.and_then(crate::portage::diskspace::low_space_warning) {
-            Some(warning) => {
-                self.updates_space_banner.set_title(&warning);
-                self.updates_space_banner.set_revealed(true);
-            }
-            None => self.updates_space_banner.set_revealed(false),
-        }
-        for atom_with_version in atoms {
-            let row = adw::ActionRow::builder().title(&atom_with_version).build();
-            row.add_prefix(&gtk::Image::from_icon_name("software-update-available-symbolic"));
 
-            // Lets one package be updated on its own instead of only via
-            // "Update All" — useful when only one update is wanted right
-            // now (e.g. everything else would pull in a long rebuild).
-            let update_button = gtk::Button::with_label("Update");
-            update_button.add_css_class("flat");
-            update_button.set_valign(gtk::Align::Center);
-            let bare_atom = strip_version_suffix(&atom_with_version);
-            let app = self.clone();
-            update_button.connect_clicked(move |button| {
-                button.set_sensitive(false);
-                app.enqueue(QueueEntry {
-                    job: emerge::install_job(&bare_atom, app.settings.borrow().prefer_binary_packages),
-                    label: format!("Updating {bare_atom}"),
-                    mutating: true,
-                    retry_with_use_fix: true,
-                    known_atoms: Vec::new(),
-                });
-            });
-            row.add_suffix(&update_button);
 
-            self.updates_list.append(&row);
-        }
-        self.updates_stack.set_visible_child_name("list");
-    }
 
-    // --- browsing -----------------------------------------------------
 
-    fn run_search(self: &Rc<Self>, query: String) {
-        if query.trim().len() < 2 {
-            self.explore_stack.set_visible_child_name("landing");
-            return;
-        }
-        self.search_generation.set(self.search_generation.get() + 1);
-        let generation = self.search_generation.get();
-
-        self.results_heading.set_text(&format!("Results for \u{201c}{query}\u{201d}"));
-        self.explore_stack.set_visible_child_name("results");
-        widgets::clear(&self.results_grid);
-        self.clear_flatpak_section();
-        self.results_spinner.start();
-        self.results_spinner.set_visible(true);
-        self.scroll_to_top();
-
-        let app = self.clone();
-        let query_for_portage = query.clone();
-        runtime::spawn_blocking(
-            move || eix::search(&query_for_portage).map_err(|e| e.to_string()),
-            move |result| {
-                if generation != app.search_generation.get() {
-                    return;
-                }
-                app.show_results(result);
-            },
-        );
-
-        // Runs fully in parallel with the Portage search above, on its
-        // own `spawn_blocking` call — never gates or delays Portage's own
-        // render. Whenever it finishes (typically a few hundred ms, but
-        // nothing here waits on that), `apply_flatpak_results` only adds
-        // chips to cards already on screen and appends the "Also
-        // available via Flatpak" section — it never reorders or replaces
-        // what Portage already drew, so a slow Flatpak search can't make
-        // already-visible results jump around.
-        if self.flatpak_available.get() {
-            let app = self.clone();
-            runtime::spawn_blocking(
-                move || (flatpak::search(&query).unwrap_or_default(), flatpak::installed().unwrap_or_default()),
-                move |(hits, installed)| {
-                    if generation != app.search_generation.get() {
-                        return;
-                    }
-                    app.apply_flatpak_results(hits, installed);
-                },
-            );
-        }
-    }
-
-    fn browse_category(self: &Rc<Self>, name: &'static str, categories: &'static [&'static str]) {
-        self.search_generation.set(self.search_generation.get() + 1);
-        let generation = self.search_generation.get();
-
-        self.search_entry.set_text("");
-        self.search_bar.set_search_mode(false);
-        self.results_heading.set_text(name);
-        self.explore_stack.set_visible_child_name("results");
-        widgets::clear(&self.results_grid);
-        // Category browsing is a curated, Portage-only showcase (like the
-        // landing carousels) — it never gets a Flatpak layer, so any
-        // leftover section from a previous free-text search is dropped.
-        self.clear_flatpak_section();
-        self.results_spinner.start();
-        self.results_spinner.set_visible(true);
-        self.scroll_to_top();
-
-        let app = self.clone();
-        runtime::spawn_blocking(
-            move || eix::list_categories(categories).map_err(|e| e.to_string()),
-            move |result| {
-                if generation != app.search_generation.get() {
-                    return;
-                }
-                app.show_results(result);
-            },
-        );
-    }
-
-    /// Puts the browse view back at the top. Called whenever what is on
-    /// screen changes wholesale — a new search, a new category — because
-    /// otherwise the previous scroll position carries over and the fresh
-    /// results open somewhere in their middle.
-    fn scroll_to_top(&self) {
-        self.explore_scroller.vadjustment().set_value(0.0);
-    }
-
-    /// The "take me back" gesture, double-click-on-the-tab triggered.
-    ///
-    /// A package detail page always pops back to the tab it was opened
-    /// from first, regardless of which tab that is. From there, behaviour
-    /// depends on *which* tab is showing: Explore has a real home (the
-    /// category-tile landing page) to unwind to, so it goes landing, then
-    /// top. Installed and Updates have no such second screen — there's
-    /// nothing to navigate to below their single list — so double-clicking
-    /// either just scrolls that list to the top, the same as double-
-    /// clicking Explore once it's already on the landing page.
-    fn home_or_top(self: &Rc<Self>) {
-        if self.nav.visible_page().and_then(|p| p.tag()).as_deref() != Some("main") {
-            self.nav.pop_to_tag("main");
-            return;
-        }
-        match self.view_stack.visible_child_name().as_deref() {
-            Some("installed") => self.installed_scroller.vadjustment().set_value(0.0),
-            Some("updates") => self.updates_scroller.vadjustment().set_value(0.0),
-            _ => {
-                if self.explore_stack.visible_child_name().as_deref() != Some("landing") {
-                    self.search_entry.set_text("");
-                    self.search_bar.set_search_mode(false);
-                    self.browsing_landing();
-                } else {
-                    self.scroll_to_top();
-                }
-            }
-        }
-    }
-
-    fn browsing_landing(self: &Rc<Self>) {
-        self.search_generation.set(self.search_generation.get() + 1);
-        self.explore_stack.set_visible_child_name("landing");
-        self.clear_flatpak_section();
-        self.scroll_to_top();
-    }
-
-    fn show_results(self: &Rc<Self>, result: Result<Vec<PackageSummary>, String>) {
-        self.results_spinner.stop();
-        self.results_spinner.set_visible(false);
-
-        let packages = match result {
-            Ok(packages) => packages,
-            Err(err) => {
-                widgets::clear(&self.results_grid);
-                self.toast(&format!("Search failed: {err}"));
-                return;
-            }
-        };
-
-        *self.last_results.borrow_mut() = packages;
-        self.render_filtered_results();
-    }
-
-    /// Re-applies the current `search_filters` (and sort order) to
-    /// `last_results` and rebuilds `results_grid` from scratch. Called
-    /// both after a fresh search/category fetch and whenever a filter
-    /// control changes — filtering is pure and in-memory, so there's
-    /// nothing to await here.
-    fn render_filtered_results(self: &Rc<Self>) {
-        widgets::clear(&self.results_grid);
-
-        let base_count = self.last_results.borrow().len();
-        let filtered = eix::apply_filters(self.last_results.borrow().clone(), &self.search_filters.borrow());
-
-        if base_count == 0 {
-            self.results_heading.set_text("No results — try a different search term");
-            return;
-        }
-        if filtered.is_empty() {
-            self.results_heading.set_text("No results match the current filters");
-            return;
-        }
-        if filtered.len() != base_count {
-            self.results_heading.set_text(&format!("{} of {} results match the current filters", filtered.len(), base_count));
-        }
-
-        let installed = self.installed.borrow();
-        let icons = self.icon_paths.borrow();
-        let mut cards = HashMap::new();
-        let chips = self.flatpak_chips.borrow();
-        for pkg in filtered.into_iter().take(300) {
-            let (card, _icon) = widgets::package_card(&pkg, &installed, &icons);
-            if chips.contains_key(&pkg.atom()) {
-                widgets::add_flatpak_chip(&card);
-            }
-            cards.insert(pkg.atom(), card.clone());
-            self.connect_card(&card, pkg);
-            self.results_grid.insert(&card, -1);
-        }
-        drop(chips);
-        *self.search_cards.borrow_mut() = cards;
-        self.scroll_to_top();
-    }
-
-    fn clear_flatpak_section(&self) {
-        while let Some(child) = self.flatpak_section.first_child() {
-            self.flatpak_section.remove(&child);
-        }
-        self.flatpak_chips.borrow_mut().clear();
-    }
-
-    /// Reconciles a Flatpak search's hits against the Portage results
-    /// already on screen (`backend::merge_search_results`): pins a
-    /// "Also on Flatpak" chip onto every card with a confident match, and
-    /// renders the rest as a collapsed section beneath the grid. Never
-    /// touches `results_grid` itself — see `run_search` for why that
-    /// matters.
-    fn apply_flatpak_results(self: &Rc<Self>, hits: Vec<flatpak::FlatpakApp>, installed: HashMap<String, flatpak::InstalledFlatpak>) {
-        let merged = backend::merge_search_results(&self.last_results.borrow(), &hits);
-        let cards = self.search_cards.borrow();
-        for atom in merged.chips.keys() {
-            if let Some(card) = cards.get(atom) {
-                widgets::add_flatpak_chip(card);
-            }
-        }
-        drop(cards);
-        *self.flatpak_chips.borrow_mut() = merged.chips;
-
-        self.clear_flatpak_section_only_content();
-        if merged.flatpak_only.is_empty() {
-            return;
-        }
-        let boxed_list = gtk::ListBox::new();
-        boxed_list.add_css_class("boxed-list");
-        let expander = adw::ExpanderRow::builder()
-            .title(format!("Also available via Flatpak ({})", merged.flatpak_only.len()))
-            .build();
-        for app in &merged.flatpak_only {
-            let already_installed = installed.contains_key(&app.app_id);
-            let row = widgets::flatpak_only_row(app, already_installed);
-            if !already_installed {
-                let app_for_click = app.clone();
-                let this = self.clone();
-                row.connect_activated(move |_| this.present_flatpak_detail(app_for_click.clone()));
-            }
-            expander.add_row(&row);
-        }
-        boxed_list.append(&expander);
-        self.flatpak_section.append(&boxed_list);
-    }
-
-    /// Like `clear_flatpak_section`, but leaves `flatpak_chips` alone —
-    /// `apply_flatpak_results` just repopulated it and clears the section
-    /// widget itself right after, so wiping the map it only just set
-    /// would be self-defeating.
-    fn clear_flatpak_section_only_content(&self) {
-        while let Some(child) = self.flatpak_section.first_child() {
-            self.flatpak_section.remove(&child);
-        }
-    }
-
-    /// The funnel popover next to search results: USE flag presence,
-    /// masked/unmasked, overlay-only, license substring, and sort — every
-    /// control writes straight into `search_filters` and re-renders
-    /// immediately via `render_filtered_results`, since filtering never
-    /// needs to touch `eix` again once a result list is in hand.
-    fn build_filter_popover(self: &Rc<Self>) -> gtk::Popover {
-        let column = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        column.set_margin_top(12);
-        column.set_margin_bottom(12);
-        column.set_margin_start(12);
-        column.set_margin_end(12);
-        column.set_width_request(280);
-
-        let use_row = adw::EntryRow::builder().title("USE flag").build();
-        let use_mode = gtk::DropDown::from_strings(&["Has flag", "Lacks flag"]);
-        use_mode.set_margin_top(4);
-
-        let masked_mode = gtk::DropDown::from_strings(&["Any", "Masked only", "Unmasked only"]);
-        let masked_label = gtk::Label::new(Some("Masked"));
-        masked_label.set_xalign(0.0);
-        masked_label.add_css_class("dim-label");
-        masked_label.add_css_class("caption");
-
-        let overlay_only = gtk::CheckButton::with_label("Overlay packages only");
-
-        let license_row = adw::EntryRow::builder().title("License contains").build();
-
-        let sort_label = gtk::Label::new(Some("Sort by"));
-        sort_label.set_xalign(0.0);
-        sort_label.add_css_class("dim-label");
-        sort_label.add_css_class("caption");
-        let sort_mode = gtk::DropDown::from_strings(&["Relevance", "Name (A–Z)", "Name (Z–A)", "License"]);
-
-        let reset_button = gtk::Button::with_label("Reset Filters");
-        reset_button.add_css_class("flat");
-
-        column.append(&use_row);
-        column.append(&use_mode);
-        column.append(&masked_label);
-        column.append(&masked_mode);
-        column.append(&overlay_only);
-        column.append(&license_row);
-        column.append(&sort_label);
-        column.append(&sort_mode);
-        column.append(&reset_button);
-
-        let apply: Rc<dyn Fn()> = Rc::new({
-            let app = self.clone();
-            let use_row = use_row.clone();
-            let use_mode = use_mode.clone();
-            let masked_mode = masked_mode.clone();
-            let overlay_only = overlay_only.clone();
-            let license_row = license_row.clone();
-            let sort_mode = sort_mode.clone();
-            let filter_button = self.filter_button.clone();
-            move || {
-                let flag = use_row.text().trim().to_string();
-                let use_flag = (!flag.is_empty())
-                    .then(|| eix::UseConstraint { flag, must_be_set: use_mode.selected() == 0 });
-                let masked = match masked_mode.selected() {
-                    1 => Some(true),
-                    2 => Some(false),
-                    _ => None,
-                };
-                let license = license_row.text().trim().to_string();
-                let sort = match sort_mode.selected() {
-                    1 => eix::SortOrder::NameAsc,
-                    2 => eix::SortOrder::NameDesc,
-                    3 => eix::SortOrder::LicenseAsc,
-                    _ => eix::SortOrder::Default,
-                };
-                let filters = eix::SearchFilters {
-                    use_flag,
-                    masked,
-                    overlay_only: overlay_only.is_active(),
-                    license: (!license.is_empty()).then_some(license),
-                    sort,
-                };
-                // A visual cue that a filter is active — otherwise a
-                // filtered-down result list with no obvious cause looks
-                // like a bug rather than a deliberate narrowing.
-                if filters.is_default() {
-                    filter_button.remove_css_class("suggested-action");
-                } else {
-                    filter_button.add_css_class("suggested-action");
-                }
-                *app.search_filters.borrow_mut() = filters;
-                app.render_filtered_results();
-            }
-        });
-
-        {
-            let apply = apply.clone();
-            use_row.connect_changed(move |_| apply());
-        }
-        {
-            let apply = apply.clone();
-            use_mode.connect_selected_notify(move |_| apply());
-        }
-        {
-            let apply = apply.clone();
-            masked_mode.connect_selected_notify(move |_| apply());
-        }
-        {
-            let apply = apply.clone();
-            overlay_only.connect_toggled(move |_| apply());
-        }
-        {
-            let apply = apply.clone();
-            license_row.connect_changed(move |_| apply());
-        }
-        {
-            let apply = apply.clone();
-            sort_mode.connect_selected_notify(move |_| apply());
-        }
-        {
-            let apply = apply.clone();
-            reset_button.connect_clicked(move |_| {
-                use_row.set_text("");
-                use_mode.set_selected(0);
-                masked_mode.set_selected(0);
-                overlay_only.set_active(false);
-                license_row.set_text("");
-                sort_mode.set_selected(0);
-                apply();
-            });
-        }
-
-        let popover = gtk::Popover::new();
-        popover.set_child(Some(&column));
-        popover
-    }
-
-    fn connect_card(self: &Rc<Self>, card: &gtk::Button, pkg: PackageSummary) {
-        let app = self.clone();
-        card.connect_clicked(move |_| app.open_detail(pkg.clone()));
-    }
-
-
-
-    fn open_detail(self: &Rc<Self>, pkg: PackageSummary) {
-        // Pushed immediately so there's something to look at while both
-        // `eix::lookup` below and the detail page's own description/
-        // screenshot enrichment (Flathub, then Terminal Trove/GitHub if
-        // still needed) are in flight — swapped for the real page in
-        // `on_ready` below once that settles, rather than pushing the real
-        // page right away and letting its content visibly fill in piece by
-        // piece.
-        let loading_page = loading_navigation_page();
-        self.nav.push(&loading_page);
-
-        // eix's search results carry no IUSE for packages matched by
-        // description, so re-look the package up to get full metadata.
-        let atom = pkg.atom();
-        let app = self.clone();
-        runtime::spawn_blocking(
-            move || eix::lookup(&atom).ok().flatten(),
-            move |full| {
-                let pkg = full.unwrap_or_else(|| pkg.clone());
-                let install_app = app.clone();
-                let uninstall_app = app.clone();
-                let sandbox_app = app.clone();
-                let flatpak_app = app.clone();
-
-                // `on_ready` needs the built page to push it, but the page
-                // isn't built until `detail::build` returns — which itself
-                // needs `on_ready` to pass in. Broken by routing the page
-                // through this cell instead of capturing it directly: by
-                // the time `on_ready` can actually run (asynchronously,
-                // after this whole function returns), `page` below has
-                // long since been stored in it.
-                let held_page: Rc<RefCell<Option<adw::NavigationPage>>> = Rc::new(RefCell::new(None));
-                let held_page_for_ready = held_page.clone();
-                let nav_for_ready = app.nav.clone();
-                let on_ready: Rc<dyn Fn()> = Rc::new(move || {
-                    if let Some(page) = held_page_for_ready.borrow_mut().take() {
-                        nav_for_ready.pop();
-                        nav_for_ready.push(&page);
-                    }
-                });
-
-                let page = detail::build(
-                    &pkg,
-                    &app.installed.borrow(),
-                    &app.icon_paths.borrow(),
-                    app.settings.borrow().prefer_binary_packages,
-                    Rc::new(move |atom: String| install_app.install(atom)),
-                    Rc::new(move |atom: String| uninstall_app.uninstall(atom)),
-                    Rc::new(move |atom: String| sandbox_app.sandbox_build(atom)),
-                    Rc::new(move |fp_app: flatpak::FlatpakApp| flatpak_app.present_flatpak_detail(fp_app)),
-                    on_ready,
-                );
-                *held_page.borrow_mut() = Some(page);
-            },
-        );
-    }
-
-    // --- jobs ----------------------------------------------------------
-
-    fn install(self: &Rc<Self>, atom: String) {
-        self.enqueue(QueueEntry {
-            job: emerge::install_job(&atom, self.settings.borrow().prefer_binary_packages),
-            label: format!("Installing {atom}"),
-            mutating: true,
-            retry_with_use_fix: true,
-            known_atoms: Vec::new(),
-        });
-    }
-
-    fn uninstall(self: &Rc<Self>, atom: String) {
-        self.enqueue(QueueEntry {
-            job: emerge::uninstall_job(&atom),
-            label: format!("Removing {atom}"),
-            mutating: true,
-            retry_with_use_fix: false,
-            known_atoms: Vec::new(),
-        });
-    }
-
-    /// Queues a build of `atom` in the isolated sandbox chroot (see
-    /// `portage::sandbox`) rather than the live system — offered from the
-    /// detail page only once a normal `--pretend` has already failed.
-    /// `mutating: false`: unlike a real install, this never touches what's
-    /// actually installed on the host, so there's nothing for a rescan
-    /// afterwards to pick up.
-    fn sandbox_build(self: &Rc<Self>, atom: String) {
-        match crate::portage::sandbox::build_job(&atom) {
-            Ok(job) => self.enqueue(QueueEntry {
-                job,
-                label: format!("Sandbox build: {atom}"),
-                mutating: false,
-                retry_with_use_fix: false,
-                known_atoms: Vec::new(),
-            }),
-            Err(err) => self.toast(&format!("Couldn't start sandbox build: {err}")),
-        }
-    }
-
-    /// Removes an outright-wasted queued job — it never got to run at
-    /// all, so unlike cancelling something in progress there's nothing
-    /// destructive here to warn about.
-    fn cancel_queued(self: &Rc<Self>, index: usize) {
-        let removed = self.queue.borrow_mut().remove(index);
-        if let Some(entry) = removed {
-            self.toast(&format!("{} — removed from queue", entry.label));
-        }
-    }
-
-    /// Moves a queued job to the very front — the "an urgent single
-    /// install shouldn't have to wait behind a multi-hour `@world`
-    /// update" case. Never touches whatever's currently running; the
-    /// bumped job simply becomes the *next* one `start_next` picks up.
-    fn prioritize_queued(self: &Rc<Self>, index: usize) {
-        let mut queue = self.queue.borrow_mut();
-        if let Some(entry) = queue.remove(index) {
-            queue.push_front(entry);
-        }
-    }
-
-    /// Shows what's waiting behind the current job — the queue is
-    /// otherwise invisible beyond a toast's passing "queued (N)" message
-    /// at the moment something's added to it.
-    fn present_queue_popover(self: &Rc<Self>, anchor: &gtk::Button) {
-        let list = gtk::ListBox::new();
-        list.add_css_class("boxed-list");
-        list.set_selection_mode(gtk::SelectionMode::None);
-
-        let popover = gtk::Popover::new();
-
-        let queue = self.queue.borrow();
-        if queue.is_empty() {
-            list.append(&adw::ActionRow::builder().title("Nothing queued").build());
-        }
-        for (index, entry) in queue.iter().enumerate() {
-            let row = adw::ActionRow::builder().title(&entry.label).build();
-
-            if index > 0 {
-                let bump = gtk::Button::from_icon_name("go-top-symbolic");
-                bump.add_css_class("flat");
-                bump.set_valign(gtk::Align::Center);
-                bump.set_tooltip_text(Some("Move to front"));
-                let app = self.clone();
-                let popover_for_bump = popover.clone();
-                bump.connect_clicked(move |_| {
-                    app.prioritize_queued(index);
-                    popover_for_bump.popdown();
-                });
-                row.add_suffix(&bump);
-            }
-
-            let cancel = gtk::Button::from_icon_name("edit-delete-symbolic");
-            cancel.add_css_class("flat");
-            cancel.set_valign(gtk::Align::Center);
-            cancel.set_tooltip_text(Some("Remove from queue"));
-            let app = self.clone();
-            let popover_for_cancel = popover.clone();
-            cancel.connect_clicked(move |_| {
-                app.cancel_queued(index);
-                popover_for_cancel.popdown();
-            });
-            row.add_suffix(&cancel);
-
-            list.append(&row);
-        }
-        drop(queue);
-
-        let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        column.set_margin_top(8);
-        column.set_margin_bottom(8);
-        column.set_margin_start(8);
-        column.set_margin_end(8);
-        column.set_size_request(280, -1);
-        column.append(&list);
-
-        // Renders the exact commands the queue would actually run —
-        // useful for running something headless over SSH, or just
-        // double-checking what the GUI is about to do before clicking
-        // through a polkit prompt. Only worth offering when there's
-        // something to export.
-        if !self.queue.borrow().is_empty() || !self.flatpak_queue.borrow().is_empty() {
-            let export_button = gtk::Button::with_label("Export Queue as Script…");
-            export_button.add_css_class("flat");
-            export_button.set_margin_top(4);
-            let app_for_export = self.clone();
-            let popover_for_export = popover.clone();
-            export_button.connect_clicked(move |_| {
-                popover_for_export.popdown();
-                app_for_export.export_queue_script();
-            });
-            column.append(&export_button);
-        }
-
-        popover.set_child(Some(&column));
-        popover.set_parent(anchor);
-        popover.connect_closed(|popover| popover.unparent());
-        popover.popup();
-    }
-
-    /// Builds a POSIX shell script covering every job currently queued in
-    /// either lane, in run order, and offers it as a save file. Purely a
-    /// snapshot of what's queued *right now* — a job that starts running
-    /// before the save dialog closes isn't un-queued from the script,
-    /// since it genuinely was part of the queue when this was asked for.
-    fn export_queue_script(self: &Rc<Self>) {
-        let mut script = String::from("#!/bin/sh\nset -e\n\n");
-        for entry in self.queue.borrow().iter() {
-            script.push_str(&format!("# {}\n{}\n\n", entry.label, entry.job.to_shell_command()));
-        }
-        for entry in self.flatpak_queue.borrow().iter() {
-            script.push_str(&format!("# {}\n{}\n\n", entry.label, entry.job.to_shell_command()));
-        }
-
-        let file_dialog = gtk::FileDialog::builder().title("Export Queue as Script").initial_name("portage-store-queue.sh").build();
-        let app = self.clone();
-        file_dialog.save(Some(&self.window), gtk::gio::Cancellable::NONE, move |result| {
-            let Ok(file) = result else { return };
-            let Some(path) = file.path() else { return };
-            let script = script.clone();
-            let app = app.clone();
-            runtime::spawn_blocking(
-                move || {
-                    std::fs::write(&path, &script)?;
-                    // Best-effort — a script you can just double-click or
-                    // `./run` beats one that needs a `chmod +x` first,
-                    // but a filesystem that doesn't support the bit
-                    // (e.g. some network mounts) shouldn't fail the
-                    // whole export over it.
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Ok(metadata) = std::fs::metadata(&path) {
-                            let mut perms = metadata.permissions();
-                            perms.set_mode(perms.mode() | 0o111);
-                            let _ = std::fs::set_permissions(&path, perms);
-                        }
-                    }
-                    Ok::<(), std::io::Error>(())
-                },
-                move |result| match result {
-                    Ok(()) => app.toast("Queue exported"),
-                    Err(err) => app.toast(&format!("Couldn't export queue: {err}")),
-                },
-            );
-        });
-    }
-
-    /// Opens a small confirm-and-install dialog for a Flatpak-only search
-    /// hit. Deliberately not routed through `detail.rs` — that page is
-    /// built entirely around Portage concepts (USE flags, `--pretend`
-    /// previews, sandbox builds) that don't apply here, and forcing a
-    /// Flatpak app through it would mean either a page half full of
-    /// disabled Portage-only controls or a much larger rewrite of that
-    /// page than this pass is scoped for.
-    fn present_flatpak_detail(self: &Rc<Self>, app: flatpak::FlatpakApp) {
-        // Fetched before the dialog even opens — showing "Install" with
-        // no size, then having a 1-2 GB runtime download turn out to be
-        // part of it, is exactly the "your warning will lie" failure
-        // mode a Flatpak-aware download size figure exists to avoid.
-        let this = self.clone();
-        let app_for_lookup = app.clone();
-        runtime::spawn_blocking(
-            move || flatpak::remote_info_size(&app_for_lookup.remote, &app_for_lookup.app_id).and_then(|(download, _)| download),
-            move |download_kib| this.present_flatpak_confirm(app.clone(), download_kib),
-        );
-    }
-
-    fn present_flatpak_confirm(self: &Rc<Self>, app: flatpak::FlatpakApp, download_kib: Option<u64>) {
-        // Driven by `Caps`, not hardcoded prose about Flatpak specifically
-        // — this is exactly the sentence that would need to change (or
-        // vanish) if a third, root-needing backend ever reused this same
-        // confirm dialog.
-        let caps = backend::SourceId::Flatpak.caps();
-        let trust_line = if caps.sandboxed && !caps.needs_root {
-            "Installs sandboxed, as your own user — no admin password needed."
-        } else {
-            "Installs on this system."
-        };
-        let mut body = if app.description.is_empty() { trust_line.to_string() } else { format!("{}\n\n{trust_line}", app.description) };
-        if let Some(kib) = download_kib {
-            body.push_str(&format!("\n\nDownload size: {} (may include a shared runtime not yet on this machine).", emerge::format_size_kib(kib)));
-        }
-        let dialog = adw::AlertDialog::new(Some(&app.name), Some(&body));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("install", "Install");
-        dialog.set_response_appearance("install", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("install"));
-        dialog.set_close_response("cancel");
-
-        let this = self.clone();
-        dialog.connect_response(None, move |_, response| {
-            if response != "install" {
-                return;
-            }
-            let this = this.clone();
-            let app = app.clone();
-            runtime::spawn_blocking(
-                move || flatpak::ensure_user_flathub().map(|()| app).map_err(|e| e.to_string()),
-                move |result| match result {
-                    Ok(app) => this.enqueue_flatpak(FlatpakQueueEntry {
-                        job: flatpak::install_job(&app.remote, &app.app_id),
-                        label: format!("Installing {} (Flatpak)", app.name),
-                    }),
-                    Err(err) => this.toast(&format!("Couldn't set up Flatpak: {err}")),
-                },
-            );
-        });
-        dialog.present(Some(&self.window));
-    }
-
-    fn enqueue_flatpak(self: &Rc<Self>, entry: FlatpakQueueEntry) {
-        let label = entry.label.clone();
-        self.flatpak_queue.borrow_mut().push_back(entry);
-        if self.flatpak_running.get() {
-            let pending = self.flatpak_queue.borrow().len();
-            self.toast(&format!("{label} — queued ({pending})"));
-        } else {
-            self.start_next_flatpak();
-        }
-    }
-
-    /// Flatpak's own lock domain — see `flatpak_queue` on `App`. Mirrors
-    /// `start_next` in shape but with none of the Portage-specific
-    /// machinery (no ETA, no USE-flag retry, no resource throttling —
-    /// none of it applies to a rootless, sandboxed, already-prebuilt
-    /// install) and can run at the same time as a Portage job is going.
-    fn start_next_flatpak(self: &Rc<Self>) {
-        let Some(entry) = self.flatpak_queue.borrow_mut().pop_front() else {
-            self.flatpak_running.set(false);
-            self.flatpak_job_revealer.set_reveal_child(false);
-            return;
-        };
-
-        self.flatpak_running.set(true);
-        self.flatpak_job_label.set_text(&entry.label);
-        self.flatpak_job_progress.set_fraction(0.0);
-        self.flatpak_job_progress.set_text(None);
-        self.flatpak_job_revealer.set_reveal_child(true);
-        self.clear_job_log("flatpak");
-
-        let done_app = self.clone();
-        let label = entry.label;
-        let progress_bar = self.flatpak_job_progress.clone();
-        let log_app = self.clone();
-        runtime::spawn_job(
-            entry.job,
-            move |line| {
-                if let Some(progress) = flatpak::parse_progress(&line) {
-                    progress_bar.set_fraction(progress.percent as f64 / 100.0);
-                    progress_bar.set_text(Some(&format!("{}%", progress.percent)));
-                }
-                log_app.append_job_log("flatpak", &line);
-            },
-            move |success| {
-                done_app.send_notification(&label, success);
-                done_app.toast(&if success { format!("{label} — done") } else { format!("{label} — failed") });
-                done_app.start_next_flatpak();
-            },
-        );
-    }
-
-    /// Offered after a `--keep-going` `@world` update finishes with some
-    /// (not all) packages failed — the whole point of `--keep-going` is
-    /// that this doesn't have to mean redoing the entire update, just
-    /// the part that actually broke.
-    fn present_keep_going_retry(self: &Rc<Self>, label: &str, failed_atoms: Vec<String>, total: usize) {
-        let title = if failed_atoms.len() == 1 {
-            "1 package failed to update".to_string()
-        } else {
-            format!("{} of {total} packages failed to update", failed_atoms.len())
-        };
-        let body = format!(
-            "{label} kept going past the failure(s) below and merged everything else successfully:\n\n{}\n\n\
-             Retry just these, or leave them for later?",
-            failed_atoms.join("\n")
-        );
-        let dialog = adw::AlertDialog::new(Some(&title), Some(&body));
-        dialog.add_response("dismiss", "Not Now");
-        dialog.add_response("retry", "Retry Failed Only");
-        dialog.set_response_appearance("retry", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("retry"));
-        dialog.set_close_response("dismiss");
-
-        let app = self.clone();
-        dialog.connect_response(None, move |_, response| {
-            if response != "retry" {
-                return;
-            }
-            let getbinpkg = app.settings.borrow().prefer_binary_packages;
-            app.enqueue(QueueEntry {
-                job: emerge::install_many_job(&failed_atoms, getbinpkg),
-                label: "Retrying failed packages".to_string(),
-                mutating: true,
-                retry_with_use_fix: true,
-                known_atoms: Vec::new(),
-            });
-        });
-        dialog.present(Some(&self.window));
-    }
-
-    fn enqueue(self: &Rc<Self>, entry: QueueEntry) {
-        let label = entry.label.clone();
-        self.queue.borrow_mut().push_back(entry);
-        if self.running.get() {
-            let pending = self.queue.borrow().len();
-            self.toast(&format!("{label} — queued ({pending})"));
-        } else {
-            self.start_next();
-        }
-    }
-
-    fn start_next(self: &Rc<Self>) {
-        let Some(mut entry) = self.queue.borrow_mut().pop_front() else {
-            self.running.set(false);
-            self.job_revealer.set_reveal_child(false);
-            return;
-        };
-
-        // "Collect at night" — a mutating job (an actual build, not a
-        // pretend/preview run) waits for the configured off-hours window
-        // instead of starting immediately, so a long queue can be left to
-        // run unattended overnight without competing with the machine
-        // during the day. Deferred jobs stay at the front of the queue
-        // and get rechecked periodically rather than blocking anything
-        // else — an urgent non-mutating check can still run in the
-        // meantime.
-        if entry.mutating && self.settings.borrow().night_builds_only && !in_night_window() {
-            self.queue.borrow_mut().push_front(entry);
-            self.running.set(false);
-            self.job_label.set_text("Waiting for night hours to build…");
-            self.job_progress.set_visible(false);
-            self.job_eta.set_visible(false);
-            self.job_log.set_text("");
-            self.job_revealer.set_reveal_child(true);
-            let app = self.clone();
-            gtk::glib::timeout_add_seconds_local(300, move || {
-                if !app.running.get() {
-                    app.start_next();
-                }
-                gtk::glib::ControlFlow::Break
-            });
-            return;
-        }
-
-        // Resource-throttled by default (see `resource_limits::throttled`)
-        // for anything that actually builds — a queued job left running
-        // for hours shouldn't be the reason something else on the machine
-        // starves for CPU/IO, and an unthrottled `MAKEOPTS` can exhaust
-        // RAM outright on a job with enough packages to build back to
-        // back.
-        if entry.mutating && self.settings.borrow().throttle_builds {
-            entry.job = crate::portage::resource_limits::throttled(entry.job);
-        }
-
-        self.running.set(true);
-        self.job_label.set_text(&entry.label);
-        self.job_log.set_text("");
-        self.clear_job_log("portage");
-        self.job_eta.set_visible(false);
-        if !entry.known_atoms.is_empty() {
-            let job_eta = self.job_eta.clone();
-            let atoms = entry.known_atoms.clone();
-            let total_atoms = atoms.len();
-            runtime::spawn_blocking(
-                move || crate::portage::qlop::average_merge_seconds_batch(&atoms),
-                move |averages| {
-                    let known = averages.len();
-                    if known == 0 {
-                        return;
-                    }
-                    let total: u64 = averages.values().map(|(secs, _)| secs).sum();
-                    let estimate = crate::portage::build_time::format_duration(total);
-                    job_eta.set_text(&if known < total_atoms {
-                        format!("Estimated ≥{estimate} ({known} of {total_atoms} packages have build history)")
-                    } else {
-                        format!("Estimated ~{estimate}")
-                    });
-                    job_eta.set_visible(true);
-                },
-            );
-        }
-        self.job_progress.set_fraction(0.0);
-        self.job_progress.set_text(None);
-        // Visible and pulsing from the moment the job starts, not just once
-        // a "Jobs: N of M" line shows up — for a job with a lot of
-        // resolving to do up front (an `@world` update easily takes a
-        // while before touching its first package), that line can be
-        // long enough coming that the bottom bar looked like an inert
-        // label with no indication anything was actually running.
-        self.job_progress.set_visible(true);
-        self.job_progress.pulse();
-        self.job_revealer.set_reveal_child(true);
-
-        let log_app = self.clone();
-        let done_app = self.clone();
-        let label = entry.label;
-        let mutating = entry.mutating;
-        let retry_with_use_fix = entry.retry_with_use_fix;
-        let job_for_retry = entry.job.clone();
-        // Install/uninstall jobs' last arg is always the atom (see
-        // `install_job`/`uninstall_job`) — used to find this exact
-        // package's own detail page, if it happens to be the one open
-        // right now, so it can show this job's progress under its own
-        // Install/Remove button instead of only in the bottom bar.
-        let job_atom = entry.job.args.last().cloned();
-        // `--depclean` only ever appears in `uninstall_job`'s args — used
-        // to tell `refresh_detail_action_button` below which way to flip
-        // once this job succeeds.
-        let job_is_install = !entry.job.args.iter().any(|a| a == "--depclean");
-        // Whether `--keep-going` even applies here — only `update_world_job`
-        // carries it, and only a job with a real, multi-package atom list
-        // up front (i.e. an `@world` update) makes "retry just what
-        // failed" a meaningfully different offer from "retry the whole
-        // job" a single-package install already gets via the USE-fix
-        // retry path.
-        let known_atom_count = entry.known_atoms.len();
-
-        // Real progress (a "Jobs: N of M" line) only starts appearing once
-        // portage is actually building/merging — dependency resolution and
-        // downloading beforehand report nothing to size a determinate bar
-        // against. Pulses (GTK's own bar animates a block sliding left to
-        // right, `bar.pulse()` on a timer) fill that stretch instead of the
-        // bar just sitting empty; `pulsing` flips false the moment real
-        // progress arrives (below) or the job ends, which is what stops
-        // the timer.
-        let pulsing = Rc::new(Cell::new(true));
-        if let Some(atom) = &job_atom
-            && let Some(page) = visible_detail_page(&self.nav, atom) {
-                if let Some(button) = detail_action_button(&page) {
-                    button.add_css_class("detail-action-pulsing");
-                }
-                if let Some(bar) = detail_progress_bar(&page) {
-                    bar.set_visible(true);
-                    bar.pulse();
-                    let pulsing_for_timer = pulsing.clone();
-                    gtk::glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
-                        if !pulsing_for_timer.get() {
-                            return gtk::glib::ControlFlow::Break;
-                        }
-                        bar.pulse();
-                        gtk::glib::ControlFlow::Continue
-                    });
-                }
-            }
-
-        // The bottom bar's own progress indicator, independent of whichever
-        // (if any) detail page is open — an `@world` update has no single
-        // package's page to show progress under, so this is the only
-        // animation it ever gets.
-        let bottom_bar = self.job_progress.clone();
-        let pulsing_for_bottom_timer = pulsing.clone();
-        gtk::glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
-            if !pulsing_for_bottom_timer.get() {
-                return gtk::glib::ControlFlow::Break;
-            }
-            bottom_bar.pulse();
-            gtk::glib::ControlFlow::Continue
-        });
-
-        // Collected alongside the log label's running "latest line" above
-        // so a failure can be inspected for a fixable cause afterwards —
-        // the label only ever shows the newest line, not the whole run.
-        let output: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let output_for_line = output.clone();
-        let pulsing_for_done = pulsing.clone();
-        runtime::spawn_job(
-            entry.job,
-            move |line| {
-                if let Some(step) = emerge::parse_step_progress(&line) {
-                    // The bar itself deliberately keeps pulsing instead of
-                    // switching to this as a determinate fraction: "Jobs: N
-                    // of M" only advances between *whole packages*
-                    // finishing, not during one's own (often multi-minute)
-                    // build — showing that fraction would leave the bar
-                    // looking frozen for most of the job instead of
-                    // reading as "still working". The count (and, once
-                    // known, which package) is still worth showing, so it
-                    // goes in the bar's own text overlay instead, updated
-                    // without disturbing the pulse.
-                    let text = match &step.atom {
-                        // `::gentoo`/`::guru`/etc. suffix trimmed — which
-                        // repo an atom came from isn't part of "what's
-                        // building right now" at a glance.
-                        Some(atom) => format!("{} / {}: {}", step.done, step.total, atom.split("::").next().unwrap_or(atom)),
-                        None => format!("{} / {}", step.done, step.total),
-                    };
-                    log_app.job_progress.set_text(Some(&text));
-                }
-                log_app.job_log.set_text(&line);
-                log_app.append_job_log("portage", &line);
-                output_for_line.borrow_mut().push(line);
-            },
-            move |success| {
-                pulsing_for_done.set(false);
-                if !success && retry_with_use_fix
-                    && let Some(relaxation) = PendingRelaxation::detect(&output.borrow()) {
-                        let done_app = done_app.clone();
-                        let job_for_retry = job_for_retry.clone();
-                        let label_for_retry = label.clone();
-
-                        // Shown before touching anything: this is a
-                        // dependency's own relaxation, not something the
-                        // user directly asked for, and applying the wrong
-                        // one (an EULA accepted site-wide, say) is worth a
-                        // look before it happens rather than an automatic
-                        // silent fix.
-                        let mut body = format!("{label_for_retry} {}\n\n", relaxation.intro());
-                        for line in relaxation.body_lines() {
-                            body.push_str(&line);
-                            body.push('\n');
-                        }
-                        body.push_str("\nApply them and retry?");
-
-                        let dialog = adw::AlertDialog::new(Some(relaxation.dialog_title()), Some(&body));
-                        dialog.add_response("cancel", "Cancel");
-                        dialog.add_response("apply", "Apply & Retry");
-                        dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
-                        dialog.set_default_response(Some("apply"));
-                        dialog.set_close_response("cancel");
-
-                        let done_app_for_present = done_app.clone();
-                        dialog.connect_response(None, move |_, response| {
-                            if response != "apply" {
-                                done_app.toast(&format!("{label_for_retry} — failed"));
-                                done_app.start_next();
-                                return;
-                            }
-                            let done_app = done_app.clone();
-                            let job_for_retry = job_for_retry.clone();
-                            let label_for_retry = label_for_retry.clone();
-                            let relaxation_kind = relaxation.noun_phrase();
-                            let relaxation = relaxation.clone();
-                            runtime::spawn_blocking(
-                                move || relaxation.apply(),
-                                move |result| {
-                                    if result.is_ok() {
-                                        // Retried once, at the front of
-                                        // the queue — with
-                                        // `retry_with_use_fix` false this
-                                        // time, so a second failure
-                                        // reports normally instead of
-                                        // looping (or prompting again).
-                                        done_app.queue.borrow_mut().push_front(QueueEntry {
-                                            job: job_for_retry.clone(),
-                                            label: label_for_retry.clone(),
-                                            mutating,
-                                            retry_with_use_fix: false,
-                                            known_atoms: Vec::new(),
-                                        });
-                                        done_app.toast(&format!("{label_for_retry} — applying {relaxation_kind}, retrying"));
-                                    } else {
-                                        done_app.toast(&format!("{label_for_retry} — failed"));
-                                    }
-                                    done_app.start_next();
-                                },
-                            );
-                        });
-                        dialog.present(Some(&done_app_for_present.window));
-                        return;
-                    }
-                // `--keep-going` (see `update_world_job`) means a big
-                // `@world` update doesn't have to be all-or-nothing —
-                // everything portage could still merge around a failure
-                // already did. Checked only for a job that started with
-                // a known multi-atom list (i.e. actually an `@world`
-                // update, the one case `--keep-going` is even on): a
-                // single-package install failing has nothing partial
-                // about it, and stays on the existing build-failure path
-                // below.
-                let failed_atoms = (!success && known_atom_count > 0)
-                    .then(|| emerge::parse_failed_packages(&output.borrow()))
-                    .unwrap_or_default();
-                // A real build failure (not the USE-flag block already
-                // handled above, not a resolver issue — an ebuild phase
-                // actually died) gets its own dialog with the log tail and
-                // follow-up actions, rather than just a toast that's easy
-                // to miss and gives no way to actually see what broke.
-                // Skipped when `failed_atoms` already has the fuller,
-                // multi-package picture — a single-package die-message
-                // dialog would just be the *first* of potentially several
-                // failures, not the whole story.
-                let build_failure =
-                    (!success && failed_atoms.is_empty()).then(|| emerge::parse_build_failure(&output.borrow())).flatten();
-                // Sent regardless of which branch below fires — a job
-                // that just finished is exactly as worth knowing about
-                // whether the window's in focus or the person's stepped
-                // away from a multi-hour build entirely, which a toast
-                // alone (gone the moment it fades, and only ever seen if
-                // this window happens to be visible right now) doesn't
-                // cover.
-                done_app.send_notification(&label, success);
-                if !failed_atoms.is_empty() {
-                    done_app.present_keep_going_retry(&label, failed_atoms, known_atom_count);
-                } else if let Some(failure) = build_failure {
-                    build_failure::present(&done_app.window, &label, failure);
-                } else {
-                    done_app.toast(&if success {
-                        format!("{label} — done")
-                    } else {
-                        format!("{label} — failed")
-                    });
-                }
-                // This exact package's own Install/Remove button, left
-                // showing its old label and no progress bar otherwise —
-                // the page was already built and on screen before this
-                // job ever started, so it has no way to know on its own
-                // that `app.installed` just changed underneath it.
-                // Flipped directly (not by rebuilding the page) rather
-                // than waiting on `rescan_installed_then` — the button
-                // only needs to know *this job's own* outcome, which is
-                // already known here, not the full freshly-rescanned map.
-                if let Some(atom) = &job_atom
-                    && let Some(page) = visible_detail_page(&done_app.nav, atom) {
-                        if success {
-                            refresh_detail_action_button(&page, job_is_install);
-                        } else {
-                            if let Some(bar) = detail_progress_bar(&page) {
-                                bar.set_visible(false);
-                            }
-                            if let Some(button) = detail_action_button(&page) {
-                                button.set_sensitive(true);
-                                button.remove_css_class("detail-action-pulsing");
-                            }
-                        }
-                    }
-                if mutating && success {
-                    done_app.rescan_installed();
-                    done_app.check_updates();
-                    done_app.check_config_protect();
-                    done_app.check_glsa();
-                    done_app.check_sync();
-                }
-                done_app.start_next();
-            },
-        );
-    }
-
-    fn toast(&self, message: &str) {
-        self.toasts.add_toast(adw::Toast::new(message));
-    }
-
-    /// Clears this lane's own lines from the log sheet for a fresh job —
-    /// called at the start of `start_next`/`start_next_flatpak` rather
-    /// than only when the drawer happens to be open, so `log_lines` never
-    /// carries a previous job's output into a new one even if the sheet
-    /// was never opened for it. Scoped to `source` rather than wiping the
-    /// whole buffer: Portage and Flatpak jobs can run at the same time
-    /// (see `flatpak_queue`'s own doc comment), and a new job starting in
-    /// one lane shouldn't erase the other lane's still-relevant,
-    /// still-running output.
-    fn clear_job_log(&self, source: &'static str) {
-        self.log_lines.borrow_mut().retain(|l| l.source != source);
-        self.render_log_drawer();
-    }
-
-    /// Appends one line to the log sheet, tagged with which lane produced
-    /// it. Re-renders immediately if the sheet is currently open (a
-    /// closed sheet just accumulates — no reason to touch the
-    /// `TextBuffer` for content nobody's looking at yet).
-    fn append_job_log(&self, source: &'static str, text: &str) {
-        let is_error = is_log_error_line(text);
-        self.log_lines.borrow_mut().push(LogLine { source, text: text.to_string(), is_error });
-        if self.log_drawer_revealer.reveals_child() {
-            self.render_log_drawer();
-        }
-    }
-
-    /// Rebuilds the log sheet's `TextBuffer` from `log_lines`, applying
-    /// the "Errors Only" filter and scrolling to the bottom — the whole
-    /// buffer is replaced rather than incrementally appended to, since
-    /// toggling the filter needs a full re-render anyway and a rebuild is
-    /// cheap even for a few thousand lines.
-    fn render_log_drawer(&self) {
-        let lines = self.log_lines.borrow();
-        let errors_only = self.log_errors_only.is_active();
-        // Both lanes can be running at once (see `flatpak_queue`'s own
-        // doc comment) — the source prefix only earns its keep when
-        // there's more than one lane's output actually present, so a
-        // single-lane run reads as a plain, unprefixed log like before.
-        let multiple_sources = lines.iter().map(|l| l.source).collect::<std::collections::HashSet<_>>().len() > 1;
-        let text: String = lines
-            .iter()
-            .filter(|l| !errors_only || l.is_error)
-            .map(|l| if multiple_sources { format!("[{}] {}", l.source, l.text) } else { l.text.clone() })
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.log_drawer_buffer.set_text(&text);
-        let end = self.log_drawer_buffer.end_iter();
-        self.log_drawer_buffer.place_cursor(&end);
-        self.log_drawer_scroller.vadjustment().set_value(self.log_drawer_scroller.vadjustment().upper());
-    }
-
-    fn toggle_log_drawer(&self) {
-        let opening = !self.log_drawer_revealer.reveals_child();
-        self.log_drawer_revealer.set_reveal_child(opening);
-        if opening {
-            self.render_log_drawer();
-        }
-    }
-
-    /// A real desktop notification, not just a toast — a multi-hour
-    /// `@world` update is exactly the kind of job someone starts and
-    /// then leaves the computer for, and a toast that's already faded by
-    /// the time they're back tells them nothing.
-    fn send_notification(&self, label: &str, success: bool) {
-        let Some(application) = self.window.application() else { return };
-        let notification = gtk::gio::Notification::new(label);
-        notification.set_body(Some(if success {
-            "Finished successfully."
-        } else {
-            "Failed — open Portage Store for details."
-        }));
-        notification.set_priority(if success {
-            gtk::gio::NotificationPriority::Normal
-        } else {
-            gtk::gio::NotificationPriority::High
-        });
-        // A fixed id (not the app id — this identifies the notification
-        // itself) so a second job finishing while the first's
-        // notification is still showing replaces it instead of stacking
-        // up duplicates for jobs that have already been superseded.
-        application.send_notification(Some("job-complete"), &notification);
-    }
 }
 
 #[cfg(test)]

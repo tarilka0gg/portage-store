@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, Default, Deserialize)]
 struct EixDump {
@@ -47,6 +49,11 @@ struct EixVersion {
     id: String,
     #[serde(rename = "@repository", default)]
     repository: Option<String>,
+    // `slot="0"` or `slot="0/3"` (slot/sub-slot) — confirmed present on
+    // real `eix --xml` output on this system (e.g. `dev-libs/openssl`
+    // carries `slot="0/3"`), previously read by nothing here.
+    #[serde(rename = "@slot", default)]
+    slot: Option<String>,
     #[serde(rename = "iuse", default)]
     iuse: Vec<IuseEntry>,
     #[serde(rename = "mask", default)]
@@ -115,20 +122,47 @@ pub struct PackageSummary {
     /// The overlay this package's latest version comes from, e.g. `"guru"`
     /// — `None` for anything in the main Gentoo tree.
     pub overlay: Option<String>,
+    /// The latest version's raw `SLOT` value, e.g. `"0"` or `"0/3"`
+    /// (slot/sub-slot) — `None` only if `eix` itself didn't report one.
+    pub slot: Option<String>,
 }
 
 impl PackageSummary {
     pub fn atom(&self) -> String {
         format!("{}/{}", self.category, self.name)
     }
+
+    /// A short value for the detail page's "Slot" row — `None` for the
+    /// trivial, uninformative case (slot `"0"` with no sub-slot, the
+    /// overwhelming majority of packages), so callers can skip rendering
+    /// a row that would say nothing anyone actually needs to know.
+    pub fn slot_label(&self) -> Option<String> {
+        let slot = self.slot.as_deref()?;
+        let (slot, subslot) = split_slot(slot);
+        match subslot {
+            Some(subslot) => Some(format!("{slot} (sub-slot {subslot})")),
+            None if slot == "0" => None,
+            None => Some(slot.to_string()),
+        }
+    }
 }
 
-fn run_eix_xml(args: &[&str]) -> Result<String> {
-    let output = Command::new("eix")
-        .arg("--xml")
-        .args(args)
-        .output()
-        .context("failed to run eix (is app-portage/eix installed?)")?;
+/// Splits a raw `SLOT` value (`"0"` or `"0/3"`) into `(slot, sub-slot)` —
+/// the sub-slot is portage's own ABI marker, present only when a package
+/// declares one.
+fn split_slot(slot: &str) -> (&str, Option<&str>) {
+    match slot.split_once('/') {
+        Some((slot, subslot)) => (slot, Some(subslot)),
+        None => (slot, None),
+    }
+}
+
+/// Dumps the entire tree — no filter args, since the in-memory index built
+/// from this is what every search/browse/lookup filters instead of asking
+/// `eix` itself to narrow it down.
+fn run_eix_xml() -> Result<String> {
+    let output =
+        Command::new("eix").arg("--xml").output().context("failed to run eix (is app-portage/eix installed?)")?;
 
     // eix exits with status 1 when a search yields no results; that's not
     // an error condition for us, just an empty result set.
@@ -143,23 +177,56 @@ fn run_eix_xml(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Every atom ("category/name") in the portage tree, one per line — cheap
-/// enough (under 200ms for the whole tree, measured directly) to fetch
-/// fresh on every fuzzy search pass below rather than caching it and
-/// risking a stale list after a sync.
-fn all_atoms() -> Result<Vec<String>> {
-    let output = Command::new("eix")
-        .arg("--only-names")
-        .output()
-        .context("failed to run eix (is app-portage/eix installed?)")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "eix --only-names exited with {:?}: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        );
+/// The whole portage tree, held in memory after the first search/browse/
+/// lookup of a session (or since the last `invalidate_index`) — `eix --xml`
+/// with no filter dumps and parses in well under a second even for a full
+/// ~20k-package tree (measured directly on this system: ~120ms for `eix`
+/// itself, XML parsing on top of that), which is cheap once but was
+/// needlessly repeated on every single search before this: `search` alone
+/// used to shell out to `eix` twice (`-s`/`-S`) *and*, for anything typo'd,
+/// a third time via `all_atoms()` (`eix --only-names`) — three subprocess
+/// spawns and three XML/text parses per keystroke, for data that can't
+/// have changed since the last sync.
+struct Index {
+    packages: Vec<PackageSummary>,
+    /// Every version of an atom (oldest first, as `eix --xml` lists them),
+    /// not just the latest one `packages` keeps — `list_versions` needs
+    /// the full history, which `dump_to_summaries` deliberately discards.
+    versions_by_atom: HashMap<String, Vec<String>>,
+}
+
+fn index_cell() -> &'static Mutex<Option<Arc<Index>>> {
+    static CELL: OnceLock<Mutex<Option<Arc<Index>>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// Drops the in-memory index so the next search/browse/lookup rebuilds it
+/// from a fresh `eix --xml` dump — called once a sync completes (see
+/// `ui::queue::start_next`), since that's the only thing that can change
+/// what the tree actually contains.
+pub fn invalidate_index() {
+    *index_cell().lock().unwrap() = None;
+}
+
+fn build_index() -> Result<Index> {
+    let xml = run_eix_xml()?;
+    let dump = parse_eix_xml(&xml)?;
+    let mut versions_by_atom = HashMap::with_capacity(dump.categories.iter().map(|c| c.packages.len()).sum());
+    for cat in &dump.categories {
+        for pkg in &cat.packages {
+            versions_by_atom.insert(format!("{}/{}", cat.name, pkg.name), pkg.versions.iter().map(|v| v.id.clone()).collect());
+        }
     }
-    Ok(String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect())
+    Ok(Index { packages: dump_to_summaries(dump), versions_by_atom })
+}
+
+fn get_index() -> Result<Arc<Index>> {
+    if let Some(index) = index_cell().lock().unwrap().clone() {
+        return Ok(index);
+    }
+    let index = Arc::new(build_index()?);
+    *index_cell().lock().unwrap() = Some(index.clone());
+    Ok(index)
 }
 
 fn dump_to_summaries(dump: EixDump) -> Vec<PackageSummary> {
@@ -178,6 +245,7 @@ fn dump_to_summaries(dump: EixDump) -> Vec<PackageSummary> {
                     iuse: latest.map(|v| parse_iuse_entries(&v.iuse)).unwrap_or_default(),
                     masked: latest.is_some_and(|v| !v.masks.is_empty()),
                     overlay: latest.and_then(|v| v.repository.clone()),
+                    slot: latest.and_then(|v| v.slot.clone()),
                 }
             })
         })
@@ -191,61 +259,50 @@ pub fn search(query: &str) -> Result<Vec<PackageSummary>> {
         return Ok(Vec::new());
     }
 
-    // eix's default search field is the package *name* only (`-s`), which
-    // misses anything a user would recognise by what it does rather than
-    // what it's called — searching "password" finds packages literally
-    // named `1password`, but not `bitwarden-desktop-bin` or `keepass`,
-    // whose names say nothing about passwords even though that's exactly
-    // what they're for. Description search (`-S`) catches those; running
-    // both and merging covers what either alone misses.
-    let mut by_atom: std::collections::HashMap<String, PackageSummary> = std::collections::HashMap::new();
-    for flag in ["-s", "-S"] {
-        let xml = run_eix_xml(&[flag, query])?;
-        let dump = parse_eix_xml(&xml)?;
-        for pkg in dump_to_summaries(dump) {
-            by_atom.entry(pkg.atom()).or_insert(pkg);
-        }
-    }
-
-    let mut results: Vec<PackageSummary> = by_atom.into_values().collect();
+    let index = get_index()?;
+    let query_lower = query.to_lowercase();
+    // Matches what two separate `eix -s`/`-S` calls used to merge: a hit on
+    // either the name or the description is enough, searched in one pass
+    // over the in-memory index rather than two subprocess round-trips.
+    let mut results: Vec<PackageSummary> = index
+        .packages
+        .iter()
+        .filter(|pkg| pkg.name.to_lowercase().contains(&query_lower) || pkg.description.to_lowercase().contains(&query_lower))
+        .cloned()
+        .collect();
     results.sort_by(|a, b| relevance_rank(a, query).cmp(&relevance_rank(b, query)).then_with(|| a.name.cmp(&b.name)));
 
     // Typo tolerance: only bother computing our own fuzzy matches when the
     // exact pass above came up empty, or its best hit is a weak one (rank
     // 2+ — a plain substring or description-only match, not a name match).
     // A strong hit already means the query wasn't a typo worth second-
-    // guessing, and this pass is not cheap: `all_atoms()` shells out to
-    // `eix --only-names` and Levenshtein-scores every one of the ~20k
-    // results, on *every* search, typo or not, if run unconditionally.
+    // guessing, and Levenshtein-scoring every one of the ~20k packages in
+    // the index isn't free even in memory.
     let best_rank = results.first().map(|pkg| relevance_rank(pkg, query));
     if best_rank.is_none_or(|rank| rank >= 2) {
-        let query_lower = query.to_lowercase();
-        if let Ok(names) = all_atoms() {
-            let existing: std::collections::HashSet<String> = results.iter().map(PackageSummary::atom).collect();
-            // Scales with query length rather than a flat cutoff: 3 stray
-            // characters ruin a 6-character query far more than an
-            // 18-character one, so the tolerance should grow with what's
-            // actually being typed instead of penalizing longer names for
-            // their length.
-            let max_distance = (query_lower.chars().count() / 3).clamp(2, 5);
-            let mut candidates: Vec<(usize, String)> = names
-                .into_iter()
-                .filter(|atom| !existing.contains(atom))
-                .filter_map(|atom| {
-                    let name = atom.split('/').next_back().unwrap_or(&atom);
-                    let distance = levenshtein(&name.to_lowercase(), &query_lower);
-                    (distance <= max_distance).then_some((distance, atom))
-                })
-                .collect();
-            candidates.sort_by_key(|(distance, _)| *distance);
-            // Nothing matched at all — most likely a typo, since a genuine
-            // "no such tool in the tree" is comparatively rare — gets more
-            // room than the "did you mean" hint appended below a page of
-            // otherwise-weak real hits.
-            candidates.truncate(if results.is_empty() { 15 } else { 5 });
-            let fuzzy = candidates.into_iter().filter_map(|(_, atom)| lookup(&atom).ok().flatten());
-            results.extend(fuzzy);
-        }
+        let existing: std::collections::HashSet<String> = results.iter().map(PackageSummary::atom).collect();
+        // Scales with query length rather than a flat cutoff: 3 stray
+        // characters ruin a 6-character query far more than an
+        // 18-character one, so the tolerance should grow with what's
+        // actually being typed instead of penalizing longer names for
+        // their length.
+        let max_distance = (query_lower.chars().count() / 3).clamp(2, 5);
+        let mut candidates: Vec<(usize, &PackageSummary)> = index
+            .packages
+            .iter()
+            .filter(|pkg| !existing.contains(&pkg.atom()))
+            .filter_map(|pkg| {
+                let distance = levenshtein(&pkg.name.to_lowercase(), &query_lower);
+                (distance <= max_distance).then_some((distance, pkg))
+            })
+            .collect();
+        candidates.sort_by_key(|(distance, _)| *distance);
+        // Nothing matched at all — most likely a typo, since a genuine
+        // "no such tool in the tree" is comparatively rare — gets more
+        // room than the "did you mean" hint appended below a page of
+        // otherwise-weak real hits.
+        candidates.truncate(if results.is_empty() { 15 } else { 5 });
+        results.extend(candidates.into_iter().map(|(_, pkg)| pkg.clone()));
     }
 
     Ok(results)
@@ -379,43 +436,32 @@ pub fn apply_filters(mut packages: Vec<PackageSummary>, filters: &SearchFilters)
     packages
 }
 
-/// Lists every package across a set of portage categories in one shot, via
-/// a `^(cat1|cat2|...)$` regex passed to `eix -C`. Used to power the
-/// curated "browse by category" groups (games, desktop, dev tools, ...)
-/// that map onto several raw portage categories at once.
+/// Lists every package across a set of portage categories in one shot —
+/// used to power the curated "browse by category" groups (games, desktop,
+/// dev tools, ...) that map onto several raw portage categories at once.
 pub fn list_categories(categories: &[&str]) -> Result<Vec<PackageSummary>> {
     if categories.is_empty() {
         return Ok(Vec::new());
     }
-    let pattern = format!("^({})$", categories.join("|"));
-    let xml = run_eix_xml(&["-C", &pattern])?;
-    let dump = parse_eix_xml(&xml)?;
-    let mut summaries = dump_to_summaries(dump);
+    let index = get_index()?;
+    let mut summaries: Vec<PackageSummary> =
+        index.packages.iter().filter(|pkg| categories.contains(&pkg.category.as_str())).cloned().collect();
     summaries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(summaries)
 }
 
 /// Look up a single package by its full atom (category/name).
 pub fn lookup(atom: &str) -> Result<Option<PackageSummary>> {
-    let xml = run_eix_xml(&["-e", atom])?;
-    let dump = parse_eix_xml(&xml)?;
-    Ok(dump_to_summaries(dump).into_iter().next())
+    let index = get_index()?;
+    Ok(index.packages.iter().find(|pkg| pkg.atom() == atom).cloned())
 }
 
 /// Every version of a package the tree currently offers, oldest first —
-/// `dump_to_summaries` only keeps the last one (the one shown everywhere
-/// else in the app), which is exactly what the version picker needs more
-/// than.
+/// `packages` only keeps the last one (the one shown everywhere else in
+/// the app), which is exactly what the version picker needs more than.
 pub fn list_versions(atom: &str) -> Result<Vec<String>> {
-    let xml = run_eix_xml(&["-e", atom])?;
-    let dump = parse_eix_xml(&xml)?;
-    Ok(dump
-        .categories
-        .into_iter()
-        .flat_map(|cat| cat.packages)
-        .flat_map(|pkg| pkg.versions)
-        .map(|v| v.id)
-        .collect())
+    let index = get_index()?;
+    Ok(index.versions_by_atom.get(atom).cloned().unwrap_or_default())
 }
 
 
@@ -434,7 +480,35 @@ mod tests {
             iuse: Vec::new(),
             masked: false,
             overlay: None,
+            slot: None,
         }
+    }
+
+    #[test]
+    fn slot_label_is_none_when_eix_reported_nothing() {
+        let p = pkg("dev-libs", "foo");
+        assert_eq!(p.slot_label(), None);
+    }
+
+    #[test]
+    fn slot_label_is_none_for_the_uninformative_bare_zero() {
+        let mut p = pkg("dev-libs", "foo");
+        p.slot = Some("0".to_string());
+        assert_eq!(p.slot_label(), None);
+    }
+
+    #[test]
+    fn slot_label_shows_a_non_trivial_slot() {
+        let mut p = pkg("kde-frameworks", "foo");
+        p.slot = Some("5".to_string());
+        assert_eq!(p.slot_label().as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn slot_label_shows_the_subslot_when_present() {
+        let mut p = pkg("dev-libs", "openssl");
+        p.slot = Some("0/3".to_string());
+        assert_eq!(p.slot_label().as_deref(), Some("0 (sub-slot 3)"));
     }
 
     #[test]

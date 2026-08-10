@@ -22,6 +22,36 @@ fail() {
     exit 1
 }
 
+# Every invocation gets exactly one line here, success or failure — the
+# actual compensating control for a passwordless doas rule: there's no
+# auth prompt to stand in the way of a bug or a compromised app binary,
+# so this is root-appended (not by the app's own unprivileged process)
+# and never silently trimmed. `LOGGED_ARGV` is captured before any
+# subcommand shifts `$@` around; safe to log verbatim (every caller pipes
+# file *content* via stdin, never argv — see the module-level comment
+# above) and truncated only as a defensive cap, not because anything
+# sensitive is expected here.
+#
+# The directory and file are created once, manually, as part of the same
+# root-privileged setup that installs this script itself:
+#   mkdir -p /var/log/portage-store && chown root:portage /var/log/portage-store && chmod 0750 /var/log/portage-store
+#   : > /var/log/portage-store/priv-helper.log && chown root:portage /var/log/portage-store/priv-helper.log && chmod 0640 /var/log/portage-store/priv-helper.log
+# `0640 root:portage` (not world-readable) matches this system's own
+# `/var/log/emerge.log` convention rather than `/etc/portage`'s
+# world-readable one — a log of every privileged action is closer to an
+# operational/security record than to declarative config. If this file
+# is ever deleted, the `>>` below would silently recreate it as
+# `root:root` under the shell's default umask instead — worth reapplying
+# the chown/chmod above if that ever happens.
+LOG_FILE="/var/log/portage-store/priv-helper.log"
+LOGGED_ARGV="$*"
+log_line() {
+    printf '%s uid=%s cmd=%s argv=%s exit=%s\n' \
+        "$(date -u +%FT%TZ)" "${DOAS_USER:-?}" "${cmd:-?}" "${LOGGED_ARGV:0:500}" "$1" \
+        >> "$LOG_FILE" 2>/dev/null || true
+}
+trap 'log_line "$?"' EXIT
+
 # Requires $1 to be an absolute path, and its *parent* directory
 # (canonicalized — the target itself may not exist yet, e.g. a brand new
 # file) to be $2 or a descendant of it. Canonicalizing the parent before
@@ -117,7 +147,34 @@ cmd_mkdir_p() {
 }
 
 cmd_git_revert() {
-    git -C "$TRACKED_DIR" revert --no-edit HEAD
+    local target="${1:-HEAD}"
+    case "$target" in
+        HEAD | [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+        *) fail "not a plausible commit-ish: $target" ;;
+    esac
+    git -C "$TRACKED_DIR" revert --no-edit "$target"
+}
+
+# Tags HEAD (force-moving the tag if it already exists, matching `git tag
+# -f`'s normal semantics) — used to mark a known-good point right before
+# a big operation like an `@world` update, so the history browser can
+# find it again later. The same conservative name-shape validation
+# `cmd_sandbox_build`/`cmd_enable_overlay` already use for their own
+# synthetic identifiers, closing off anything that could be misread as a
+# git option by starting with `-`.
+cmd_git_tag() {
+    local name="$1"
+    case "$name" in
+        # First character deliberately excludes `-`/`.` (unlike the rest
+        # of the name) — a leading `-` is exactly what could get misread
+        # as a git option, and `--` before `$name` in the actual `git
+        # tag` call below is the real protection, but the validation
+        # should say what it means rather than accidentally allowing the
+        # one shape it claims to reject.
+        [a-zA-Z0-9_][a-zA-Z0-9_.-]*) ;;
+        *) fail "not a plausible tag name: $name" ;;
+    esac
+    git -C "$TRACKED_DIR" tag -f -- "$name"
 }
 
 # The source directory is this app's own extracted-bundle temp dir — not
@@ -164,14 +221,21 @@ cmd_run() {
     shift
     case "$binary" in
         emerge)
+            # Not `exec`'d: an `exec`'d child replaces the shell's own
+            # process image, which means the `trap ... EXIT` above set up
+            # to log this invocation's outcome would never fire for it —
+            # running it as a normal foreground command instead costs one
+            # extra process (the parent shell surviving to report exit
+            # status) but keeps the audit log correct for every
+            # subcommand uniformly, not just the ones that don't exec.
             if [ -n "$jobs" ]; then
-                exec ionice -c 3 nice -n 19 env "MAKEOPTS=-j$jobs -l$jobs" /usr/bin/emerge "$@"
+                ionice -c 3 nice -n 19 env "MAKEOPTS=-j$jobs -l$jobs" /usr/bin/emerge "$@"
             else
-                exec /usr/bin/emerge "$@"
+                /usr/bin/emerge "$@"
             fi
             ;;
         eselect|eclean-dist|eclean-pkg)
-            exec "$binary" "$@"
+            "$binary" "$@"
             ;;
         *)
             fail "binary not permitted: $binary"
@@ -191,7 +255,9 @@ cmd_enable_overlay() {
         *) fail "not a plausible overlay name: $name" ;;
     esac
     eselect repository enable -- "$name"
-    exec emerge --sync --repo "$name"
+    # Not `exec`'d — see `cmd_run`'s comment on why every subcommand here
+    # runs as a normal foreground command rather than replacing the shell.
+    emerge --sync --repo "$name"
 }
 
 # A synthetic "binary" name, not a real executable — dispatched separately
@@ -203,7 +269,9 @@ cmd_sandbox_build() {
         [a-zA-Z0-9_+-]*/[a-zA-Z0-9_+.-]*) ;;
         *) fail "not a plausible atom: $atom" ;;
     esac
-    exec "$HELPER_DIR/sandbox-build.sh" "$atom"
+    # Not `exec`'d — see `cmd_run`'s comment on why every subcommand here
+    # runs as a normal foreground command rather than replacing the shell.
+    "$HELPER_DIR/sandbox-build.sh" "$atom"
 }
 
 cmd="${1:-}"
@@ -218,6 +286,7 @@ case "$cmd" in
     remove-file) cmd_remove_file "$@" ;;
     mkdir-p) cmd_mkdir_p "$@" ;;
     git-revert) cmd_git_revert "$@" ;;
+    git-tag) cmd_git_tag "$@" ;;
     cp-bundle) cmd_cp_bundle "$@" ;;
     cat-log) cmd_cat_log "$@" ;;
     run) cmd_run "$@" ;;

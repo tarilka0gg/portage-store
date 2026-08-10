@@ -58,6 +58,16 @@ pub struct Settings {
     /// opens, so a crash mid-wizard doesn't silently mark it seen.
     #[serde(default)]
     pub onboarding_shown: bool,
+    /// Whether install/update jobs pass `--buildpkg`, caching a local
+    /// binary package of whatever gets merged so an older version stays
+    /// available to reinstall later without recompiling (see
+    /// `binpkg::downgrade_job`). Off by default — unlike
+    /// `prefer_binary_packages` (strictly faster, no downside),
+    /// `--buildpkg` adds real build time and disk usage to every
+    /// install, which isn't a "why wouldn't you" default the way pulling
+    /// an existing prebuilt is.
+    #[serde(default)]
+    pub buildpkg_on_install: bool,
 }
 
 fn default_true() -> bool {
@@ -73,6 +83,7 @@ impl Default for Settings {
             night_builds_only: false,
             periodic_health_checks: false,
             onboarding_shown: false,
+            buildpkg_on_install: false,
         }
     }
 }

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.gentoo.PortageStore</id>
+  <name>Portage Store</name>
+  <summary>Search, install, and manage Gentoo packages</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <!-- REPLACE-ME: match whatever LICENSE the repo actually ships. -->
+  <project_license>MIT</project_license>
+  <developer id="org.gentoo">
+    <name>Gentoo Authors</name>
+    <!-- REPLACE-ME: point at the actual maintainer/team if this isn't
+         submitted as an official Gentoo project component. -->
+  </developer>
+
+  <description>
+    <p>
+      Portage Store is a GTK4/libadwaita application for Gentoo Linux that
+      brings package search, installs, updates, and system maintenance
+      into a single graphical app-store-style window instead of the
+      terminal.
+    </p>
+    <p>Highlights:</p>
+    <ul>
+      <li>Search and browse the Portage tree, with curated category and Flatpak results side by side</li>
+      <li>A single job queue for installs, removals, and updates, with live build output</li>
+      <li>Automatic USE-flag, keyword, and license conflict detection with one-click resolution</li>
+      <li>Security-advisory (GLSA) and orphaned-package (preserved-rebuild/depclean) checks</li>
+      <li>Shareable USE-flag and starter-package presets, and full profile bundle export/import</li>
+      <li>A terminal companion (portage-store-cli) sharing the same package-management core</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">org.gentoo.PortageStore.desktop</launchable>
+
+  <categories>
+    <category>System</category>
+    <category>PackageManager</category>
+  </categories>
+
+  <!-- REPLACE-ME: at least one real screenshot is expected before this
+       is accepted anywhere that renders AppStream metadata (GNOME
+       Software, Discover, etc.) — placeholder left empty rather than
+       pointing at a URL that doesn't exist yet. -->
+  <screenshots>
+    <screenshot type="default">
+      <caption>Browsing packages</caption>
+      <image>https://REPLACE-ME/screenshot-explore.png</image>
+    </screenshot>
+  </screenshots>
+
+  <url type="homepage">https://github.com/REPLACE-ME/portage-store</url>
+  <url type="bugtracker">https://github.com/REPLACE-ME/portage-store/issues</url>
+
+  <provides>
+    <binary>portage-store</binary>
+    <binary>portage-store-cli</binary>
+  </provides>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-10">
+      <description>
+        <p>Initial release.</p>
+      </description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1"/>
+</component>

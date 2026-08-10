@@ -1,4 +1,4 @@
-use crate::portage::news::{self, NewsItem};
+use portage_store::portage::news::{self, NewsItem};
 use crate::ui::runtime;
 use adw::prelude::*;
 use std::rc::Rc;

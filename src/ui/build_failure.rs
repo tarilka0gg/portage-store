@@ -1,4 +1,4 @@
-use crate::portage::emerge::BuildFailure;
+use portage_store::portage::emerge::BuildFailure;
 use crate::ui::runtime;
 use adw::prelude::*;
 
@@ -123,7 +123,7 @@ pub fn present(anchor: &impl IsA<gtk::Widget>, label: &str, failure: BuildFailur
             let log_label = log_label.clone();
             let copy_button = copy_button.clone();
             runtime::spawn_blocking(
-                move || crate::portage::emerge::read_build_log(&path),
+                move || portage_store::portage::emerge::read_build_log(&path),
                 move |result| match result {
                     Ok(text) => {
                         let tail_text = tail(&text, TAIL_LINES);

@@ -1,5 +1,5 @@
 use super::App;
-use crate::portage::{depclean, emerge, glsa, health_history, sync};
+use portage_store::portage::{depclean, emerge, glsa, health_history, sync};
 use crate::ui::runtime;
 use adw::prelude::*;
 use std::cell::Cell;
@@ -170,7 +170,11 @@ pub fn present(app: &Rc<App>) {
         preserved_action.connect_clicked(move |button| {
             button.set_sensitive(false);
             app.enqueue(super::QueueEntry {
-                job: emerge::install_job("@preserved-rebuild", app.settings.borrow().prefer_binary_packages),
+                job: emerge::install_job(
+                    "@preserved-rebuild",
+                    app.settings.borrow().prefer_binary_packages,
+                    app.settings.borrow().buildpkg_on_install,
+                ),
                 label: "Rebuilding against preserved libraries".to_string(),
                 mutating: true,
                 retry_with_use_fix: true,

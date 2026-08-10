@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Placeholder icon — a generic package-box glyph, not real branding.
+     Replace before submitting to GURU or any app store. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8560e8"/>
+      <stop offset="1" stop-color="#5e3ec2"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#bg)"/>
+  <g fill="none" stroke="#ffffff" stroke-width="6" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M64 30 L100 48 L100 84 L64 102 L28 84 L28 48 Z"/>
+    <path d="M28 48 L64 66 L100 48"/>
+    <path d="M64 66 L64 102"/>
+    <path d="M46 39 L82 57"/>
+  </g>
+</svg>
