@@ -38,12 +38,12 @@
 
   <screenshots>
     <screenshot type="default">
-      <caption>Searching for a package</caption>
-      <image>https://raw.githubusercontent.com/tarilka0gg/portage-store/master/docs/screenshots/search.png</image>
-    </screenshot>
-    <screenshot>
       <caption>Browsing packages by category</caption>
       <image>https://raw.githubusercontent.com/tarilka0gg/portage-store/master/docs/screenshots/explore.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Searching for a package</caption>
+      <image>https://raw.githubusercontent.com/tarilka0gg/portage-store/master/docs/screenshots/search.png</image>
     </screenshot>
     <screenshot>
       <caption>A package detail page</caption>
