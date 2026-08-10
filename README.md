@@ -21,6 +21,61 @@ portage-store-cli      # the same core, no window
 
 ---
 
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/explore.png" alt="The Explore landing page: category tiles above auto-advancing themed carousels" width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/detail.png" alt="A package detail page with upstream screenshots and fact tiles" width="100%"></td>
+  </tr>
+  <tr>
+    <td><b>Explore</b><br><sub>Category tiles above auto-advancing themed carousels.</sub></td>
+    <td><b>Package detail</b><br><sub>Upstream screenshots, plus download size, install method, build time, and version.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/use-flags.png" alt="The USE flag editor" width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/detail-versions.png" alt="Versions and package details" width="100%"></td>
+  </tr>
+  <tr>
+    <td><b>Build options</b><br><sub>Every USE flag with its description, and how many other installed packages share it.</sub></td>
+    <td><b>Versions and details</b><br><sub>What the tree offers, plus license, slot, and upstream links.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/job-queue.png" alt="A sync running in the bottom job bar with the queue popover open" width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/log-drawer.png" alt="The log drawer streaming live sync output" width="100%"></td>
+  </tr>
+  <tr>
+    <td><b>Job queue</b><br><sub>What's running, and everything waiting behind it.</sub></td>
+    <td><b>Live output</b><br><sub>The full build log, with an errors-only filter.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/updates.png" alt="The Updates tab showing an up-to-date system" width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/search-flatpak.png" alt="The Flatpak section expanded below the Portage results" width="100%"></td>
+  </tr>
+  <tr>
+    <td><b>Updates</b><br><sub>Pending <code>@world</code> updates, security advisories, and health banners.</sub></td>
+    <td><b>Flatpak</b><br><sub>Flatpak-only matches, collapsed beneath the Portage results.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/settings-make-conf.png" alt="Portage Settings showing make.conf variables" width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/settings-env-files.png" alt="The Env Files page" width="100%"></td>
+  </tr>
+  <tr>
+    <td><b>Portage settings</b><br><sub><code>make.conf</code> as fields, with overlays, profile, and kernel alongside.</sub></td>
+    <td><b>Env files</b><br><sub>Per-package <code>package.env</code> overrides, edited inline.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/presets.png" alt="The Package Presets dialog" width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/cleanup.png" alt="The Free Up Space dialog" width="100%"></td>
+  </tr>
+  <tr>
+    <td><b>Presets</b><br><sub>Shareable USE flags plus a starter package list.</sub></td>
+    <td><b>Free up space</b><br><sub>What each Portage cache would reclaim, before clearing it.</sub></td>
+  </tr>
+</table>
+
+---
+
 ## Features
 
 ### Finding things
@@ -35,8 +90,6 @@ portage-store-cli      # the same core, no window
 - **Search operators** — `cat:games-*`, `use:wayland`, `installed:true`, `@world` —
   applied in memory, so changing one re-renders instantly.
 - **Curated category tiles** and a landing page of themed carousels.
-
-![The Explore landing page: category tiles above auto-advancing themed carousels](docs/screenshots/explore.png)
 
 ### Installing and managing
 
@@ -56,10 +109,6 @@ portage-store-cli      # the same core, no window
 - **Sandbox builds.** When a package won't resolve on the live system, build it in a
   disposable chroot instead.
 - **Downgrades** from locally cached binary packages.
-
-![A sync running in the bottom job bar, with the queue popover open](docs/screenshots/job-queue.png)
-
-![The log drawer open over the Updates tab, streaming live sync output](docs/screenshots/log-drawer.png)
 
 ### Knowing what's wrong
 
@@ -83,10 +132,6 @@ portage-store-cli      # the same core, no window
 - Man page, upstream AppStream metadata, GitHub social card, and Gentoo wiki/Bugzilla
   mentions, when they exist.
 
-![A package detail page: upstream screenshots, description, and fact tiles for download size, install method, build time, and version](docs/screenshots/detail.png)
-
-![The USE flag editor, each flag with its description and how many other installed packages also use it](docs/screenshots/use-flags.png)
-
 ### Sharing a setup
 
 - **Presets** — a named bundle of USE flags plus a starter package list ("Gaming
@@ -95,8 +140,6 @@ portage-store-cli      # the same core, no window
 - **Profile bundles** — the whole picture: `@world` plus every file under
   `/etc/portage`, tarred up. Importing shows a diff of what would actually change
   before touching anything.
-
-![The Package Presets dialog, listing Gaming Desktop and Minimal Server with export and apply actions](docs/screenshots/presets.png)
 
 ### System configuration
 
@@ -107,40 +150,11 @@ page over its own module.
 Every write this app makes under `/etc/portage` is **committed to a git repo there**,
 browsable and revertible from the GUI.
 
-![Portage Settings: make.conf variables edited as fields, with a sidebar for overlays, env files, profile, and kernel](docs/screenshots/settings-make-conf.png)
-
 ### Flatpak
 
 A second, fully independent job lane. Flatpak has no global lock, so a Flatpak update
 never waits behind an hours-long `@world` rebuild. Flatpak-only search hits appear as a
 collapsed strip beneath the Portage results, never mixed into them.
-
-![The collapsed Flatpak section expanded, listing Flatpak-only matches below the Portage results](docs/screenshots/search-flatpak.png)
-
-<details>
-<summary><b>More screenshots</b></summary>
-
-The Updates tab, with nothing pending:
-
-![The Updates tab showing an up-to-date system](docs/screenshots/updates.png)
-
-Versions and package details further down a detail page:
-
-![Available versions, license, portage category, slot, and upstream links](docs/screenshots/detail-versions.png)
-
-Upstream screenshots open full-size in place:
-
-![A package screenshot opened in the full-size viewer](docs/screenshots/detail-screenshot-viewer.png)
-
-`package.env` overrides, editable inline:
-
-![The Env Files page, showing per-file shell variable overrides expanded inline](docs/screenshots/settings-env-files.png)
-
-Reclaiming disk space from Portage's caches:
-
-![The Free Up Space dialog, previewing what each cache would reclaim](docs/screenshots/cleanup.png)
-
-</details>
 
 ---
 
