@@ -25,20 +25,28 @@ portage-store-cli      # the same core, no window
 
 <table>
   <tr>
+    <td width="50%"><img src="docs/screenshots/explore.png" alt="The Explore landing page: category tiles above auto-advancing themed carousels" width="100%"></td>
     <td width="50%"><img src="docs/screenshots/search.png" alt="Search results, with Portage hits first and Flatpak matches collapsed underneath" width="100%"></td>
-    <td width="50%"><img src="docs/screenshots/detail.png" alt="A package detail page with upstream screenshots and fact tiles" width="100%"></td>
   </tr>
   <tr>
+    <td><b>Explore</b><br><sub>Category tiles above auto-advancing themed carousels.</sub></td>
     <td><b>Search</b><br><sub>Name and description matches, ranked, with Flatpak hits kept separate.</sub></td>
-    <td><b>Package detail</b><br><sub>Upstream screenshots, plus download size, install method, build time, and version.</sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/use-flags.png" alt="The USE flag editor" width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/detail.png" alt="A package detail page with upstream screenshots and fact tiles" width="100%"></td>
     <td width="50%"><img src="docs/screenshots/detail-versions.png" alt="Versions and package details" width="100%"></td>
   </tr>
   <tr>
-    <td><b>Build options</b><br><sub>Every USE flag with its description, and how many other installed packages share it.</sub></td>
+    <td><b>Package detail</b><br><sub>Upstream screenshots, plus download size, install method, build time, and version.</sub></td>
     <td><b>Versions and details</b><br><sub>What the tree offers, plus license, slot, and upstream links.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/use-flags.png" alt="The USE flag editor" width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/detail-screenshot-viewer.png" alt="A package screenshot opened in the full-size viewer" width="100%"></td>
+  </tr>
+  <tr>
+    <td><b>Build options</b><br><sub>Every USE flag with its description, and how many other installed packages share it.</sub></td>
+    <td><b>Screenshot viewer</b><br><sub>Upstream screenshots open full-size in place.</sub></td>
   </tr>
   <tr>
     <td width="50%"><img src="docs/screenshots/job-queue.png" alt="A sync running in the bottom job bar with the queue popover open" width="100%"></td>
