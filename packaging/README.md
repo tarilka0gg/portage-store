@@ -35,9 +35,11 @@ fix the items below before opening a GURU pull request.
    crates as of when this was drafted) — too many to transcribe by hand
    without risking a wrong checksum. `cargo-ebuild` writes the whole
    `CRATES` block for you; paste it in.
-3. **Placeholders**: `<maintainer>` in `metadata.xml`, `<screenshots>` in
-   the metainfo, and the icon itself (a generic placeholder glyph, not
-   real branding) all need real values — none were guessed here.
+3. **Placeholders**: `<maintainer>` in `metadata.xml` and the icon itself
+   (a generic placeholder glyph, not real branding) still need real
+   values — neither was guessed here. The metainfo's `<screenshots>` now
+   point at `docs/screenshots/` via `raw.githubusercontent.com`, which
+   works but ties the AppStream data to this repo staying at that path.
 4. **`KEYWORDS=""`** is intentionally empty — a brand-new package starts
    keyword-masked; don't add `~amd64` etc. until it's actually been built
    and tested via the ebuild itself, not just `cargo build`.

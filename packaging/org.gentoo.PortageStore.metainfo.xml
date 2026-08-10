@@ -36,14 +36,22 @@
     <category>PackageManager</category>
   </categories>
 
-  <!-- REPLACE-ME: at least one real screenshot is expected before this
-       is accepted anywhere that renders AppStream metadata (GNOME
-       Software, Discover, etc.) — placeholder left empty rather than
-       pointing at a URL that doesn't exist yet. -->
   <screenshots>
     <screenshot type="default">
-      <caption>Browsing packages</caption>
-      <image>https://REPLACE-ME/screenshot-explore.png</image>
+      <caption>Searching for a package</caption>
+      <image>https://raw.githubusercontent.com/tarilka0gg/portage-store/master/docs/screenshots/search.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Browsing packages by category</caption>
+      <image>https://raw.githubusercontent.com/tarilka0gg/portage-store/master/docs/screenshots/explore.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>A package detail page</caption>
+      <image>https://raw.githubusercontent.com/tarilka0gg/portage-store/master/docs/screenshots/detail.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Turning build options on and off</caption>
+      <image>https://raw.githubusercontent.com/tarilka0gg/portage-store/master/docs/screenshots/use-flags.png</image>
     </screenshot>
   </screenshots>
 

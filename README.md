@@ -17,6 +17,8 @@ portage-store-cli      # the same core, no window
 > model (see below) is deliberately documented rather than hidden — read it before
 > installing.
 
+![Search results, with Portage hits first and Flatpak matches collapsed underneath](docs/screenshots/search.png)
+
 ---
 
 ## Features
@@ -33,6 +35,8 @@ portage-store-cli      # the same core, no window
 - **Search operators** — `cat:games-*`, `use:wayland`, `installed:true`, `@world` —
   applied in memory, so changing one re-renders instantly.
 - **Curated category tiles** and a landing page of themed carousels.
+
+![The Explore landing page: category tiles above auto-advancing themed carousels](docs/screenshots/explore.png)
 
 ### Installing and managing
 
@@ -52,6 +56,10 @@ portage-store-cli      # the same core, no window
 - **Sandbox builds.** When a package won't resolve on the live system, build it in a
   disposable chroot instead.
 - **Downgrades** from locally cached binary packages.
+
+![A sync running in the bottom job bar, with the queue popover open](docs/screenshots/job-queue.png)
+
+![The log drawer open over the Updates tab, streaming live sync output](docs/screenshots/log-drawer.png)
 
 ### Knowing what's wrong
 
@@ -75,6 +83,10 @@ portage-store-cli      # the same core, no window
 - Man page, upstream AppStream metadata, GitHub social card, and Gentoo wiki/Bugzilla
   mentions, when they exist.
 
+![A package detail page: upstream screenshots, description, and fact tiles for download size, install method, build time, and version](docs/screenshots/detail.png)
+
+![The USE flag editor, each flag with its description and how many other installed packages also use it](docs/screenshots/use-flags.png)
+
 ### Sharing a setup
 
 - **Presets** — a named bundle of USE flags plus a starter package list ("Gaming
@@ -83,6 +95,8 @@ portage-store-cli      # the same core, no window
 - **Profile bundles** — the whole picture: `@world` plus every file under
   `/etc/portage`, tarred up. Importing shows a diff of what would actually change
   before touching anything.
+
+![The Package Presets dialog, listing Gaming Desktop and Minimal Server with export and apply actions](docs/screenshots/presets.png)
 
 ### System configuration
 
@@ -93,11 +107,40 @@ page over its own module.
 Every write this app makes under `/etc/portage` is **committed to a git repo there**,
 browsable and revertible from the GUI.
 
+![Portage Settings: make.conf variables edited as fields, with a sidebar for overlays, env files, profile, and kernel](docs/screenshots/settings-make-conf.png)
+
 ### Flatpak
 
 A second, fully independent job lane. Flatpak has no global lock, so a Flatpak update
 never waits behind an hours-long `@world` rebuild. Flatpak-only search hits appear as a
 collapsed strip beneath the Portage results, never mixed into them.
+
+![The collapsed Flatpak section expanded, listing Flatpak-only matches below the Portage results](docs/screenshots/search-flatpak.png)
+
+<details>
+<summary><b>More screenshots</b></summary>
+
+The Updates tab, with nothing pending:
+
+![The Updates tab showing an up-to-date system](docs/screenshots/updates.png)
+
+Versions and package details further down a detail page:
+
+![Available versions, license, portage category, slot, and upstream links](docs/screenshots/detail-versions.png)
+
+Upstream screenshots open full-size in place:
+
+![A package screenshot opened in the full-size viewer](docs/screenshots/detail-screenshot-viewer.png)
+
+`package.env` overrides, editable inline:
+
+![The Env Files page, showing per-file shell variable overrides expanded inline](docs/screenshots/settings-env-files.png)
+
+Reclaiming disk space from Portage's caches:
+
+![The Free Up Space dialog, previewing what each cache would reclaim](docs/screenshots/cleanup.png)
+
+</details>
 
 ---
 
