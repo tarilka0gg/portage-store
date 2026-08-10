@@ -12,12 +12,10 @@ CRATES=""
 inherit cargo git-r3 xdg
 
 DESCRIPTION="GTK4/libadwaita GUI app store for Gentoo Portage, with an optional Flatpak lane"
-HOMEPAGE="https://github.com/REPLACE-ME/portage-store"
-EGIT_REPO_URI="https://github.com/REPLACE-ME/portage-store.git"
+HOMEPAGE="https://github.com/tarilka0gg/portage-store"
+EGIT_REPO_URI="https://github.com/tarilka0gg/portage-store.git"
 
-LICENSE="MIT"
-# ^ REPLACE-ME: set to whatever license the repo actually ships (no
-#   LICENSE file existed in the tree this ebuild was drafted from).
+LICENSE="GPL-2"
 SLOT="0"
 KEYWORDS=""
 IUSE="webview"

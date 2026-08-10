@@ -4,8 +4,7 @@
   <name>Portage Store</name>
   <summary>Search, install, and manage Gentoo packages</summary>
   <metadata_license>CC0-1.0</metadata_license>
-  <!-- REPLACE-ME: match whatever LICENSE the repo actually ships. -->
-  <project_license>MIT</project_license>
+  <project_license>GPL-2.0-only</project_license>
   <developer id="org.gentoo">
     <name>Gentoo Authors</name>
     <!-- REPLACE-ME: point at the actual maintainer/team if this isn't
@@ -48,8 +47,8 @@
     </screenshot>
   </screenshots>
 
-  <url type="homepage">https://github.com/REPLACE-ME/portage-store</url>
-  <url type="bugtracker">https://github.com/REPLACE-ME/portage-store/issues</url>
+  <url type="homepage">https://github.com/tarilka0gg/portage-store</url>
+  <url type="bugtracker">https://github.com/tarilka0gg/portage-store/issues</url>
 
   <provides>
     <binary>portage-store</binary>

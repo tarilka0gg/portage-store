@@ -35,16 +35,12 @@ fix the items below before opening a GURU pull request.
    crates as of when this was drafted) — too many to transcribe by hand
    without risking a wrong checksum. `cargo-ebuild` writes the whole
    `CRATES` block for you; paste it in.
-3. **Placeholders**: `HOMEPAGE`/`EGIT_REPO_URI`/`LICENSE` in the ebuild,
-   `<remote-id>`/`<maintainer>` in `metadata.xml`, `<url>`/`<screenshots>`
-   in the metainfo, and the icon itself (a generic placeholder glyph, not
+3. **Placeholders**: `<maintainer>` in `metadata.xml`, `<screenshots>` in
+   the metainfo, and the icon itself (a generic placeholder glyph, not
    real branding) all need real values — none were guessed here.
 4. **`KEYWORDS=""`** is intentionally empty — a brand-new package starts
    keyword-masked; don't add `~amd64` etc. until it's actually been built
    and tested via the ebuild itself, not just `cargo build`.
-5. **License**: no `LICENSE` file exists anywhere in this repo yet. The
-   ebuild/metainfo both currently guess MIT — confirm (or add a real
-   `LICENSE` file) before submitting, since GURU checks this.
 
 ## Testing locally
 
