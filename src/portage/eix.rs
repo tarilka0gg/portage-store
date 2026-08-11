@@ -187,8 +187,23 @@ fn run_eix_xml() -> Result<String> {
 /// a third time via `all_atoms()` (`eix --only-names`) — three subprocess
 /// spawns and three XML/text parses per keystroke, for data that can't
 /// have changed since the last sync.
+/// A package summary plus the lowercased forms of its name/description,
+/// computed once at index-build time instead of on every keystroke —
+/// `search` used to call `.to_lowercase()` on both fields for all ~20k
+/// packages on every single call (and `relevance_rank` lowercased the name
+/// *again* for every comparison in the sort). `summary` is `Arc`-wrapped so
+/// results can be collected as cheap pointer clones while filtering/
+/// sorting/deduping, with the one unavoidable deep clone happening only
+/// once, at the point each function hands an owned `PackageSummary` back
+/// to its caller.
+struct IndexedPackage {
+    summary: Arc<PackageSummary>,
+    name_lower: String,
+    description_lower: String,
+}
+
 struct Index {
-    packages: Vec<PackageSummary>,
+    packages: Vec<IndexedPackage>,
     /// Every version of an atom (oldest first, as `eix --xml` lists them),
     /// not just the latest one `packages` keeps — `list_versions` needs
     /// the full history, which `dump_to_summaries` deliberately discards.
@@ -217,7 +232,15 @@ fn build_index() -> Result<Index> {
             versions_by_atom.insert(format!("{}/{}", cat.name, pkg.name), pkg.versions.iter().map(|v| v.id.clone()).collect());
         }
     }
-    Ok(Index { packages: dump_to_summaries(dump), versions_by_atom })
+    let packages = dump_to_summaries(dump)
+        .into_iter()
+        .map(|summary| {
+            let name_lower = summary.name.to_lowercase();
+            let description_lower = summary.description.to_lowercase();
+            IndexedPackage { summary: Arc::new(summary), name_lower, description_lower }
+        })
+        .collect();
+    Ok(Index { packages, versions_by_atom })
 }
 
 fn get_index() -> Result<Arc<Index>> {
@@ -264,13 +287,18 @@ pub fn search(query: &str) -> Result<Vec<PackageSummary>> {
     // Matches what two separate `eix -s`/`-S` calls used to merge: a hit on
     // either the name or the description is enough, searched in one pass
     // over the in-memory index rather than two subprocess round-trips.
-    let mut results: Vec<PackageSummary> = index
+    // `name_lower`/`description_lower` are precomputed once per package at
+    // index-build time (see `IndexedPackage`), not on every call.
+    let mut results: Vec<&IndexedPackage> = index
         .packages
         .iter()
-        .filter(|pkg| pkg.name.to_lowercase().contains(&query_lower) || pkg.description.to_lowercase().contains(&query_lower))
-        .cloned()
+        .filter(|p| p.name_lower.contains(&query_lower) || p.description_lower.contains(&query_lower))
         .collect();
-    results.sort_by(|a, b| relevance_rank(a, query).cmp(&relevance_rank(b, query)).then_with(|| a.name.cmp(&b.name)));
+    results.sort_by(|a, b| {
+        relevance_rank(&a.name_lower, &query_lower)
+            .cmp(&relevance_rank(&b.name_lower, &query_lower))
+            .then_with(|| a.summary.name.cmp(&b.summary.name))
+    });
 
     // Typo tolerance: only bother computing our own fuzzy matches when the
     // exact pass above came up empty, or its best hit is a weak one (rank
@@ -278,22 +306,27 @@ pub fn search(query: &str) -> Result<Vec<PackageSummary>> {
     // A strong hit already means the query wasn't a typo worth second-
     // guessing, and Levenshtein-scoring every one of the ~20k packages in
     // the index isn't free even in memory.
-    let best_rank = results.first().map(|pkg| relevance_rank(pkg, query));
+    let best_rank = results.first().map(|p| relevance_rank(&p.name_lower, &query_lower));
     if best_rank.is_none_or(|rank| rank >= 2) {
-        let existing: std::collections::HashSet<String> = results.iter().map(PackageSummary::atom).collect();
+        // Identity (pointer) comparison instead of rebuilding `pkg.atom()`
+        // (a `format!` allocation) for every already-found result just to
+        // dedupe against it — every entry here and in `index.packages`
+        // shares the same `Arc`s, so pointer equality is exact.
+        let existing: std::collections::HashSet<*const PackageSummary> =
+            results.iter().map(|p| Arc::as_ptr(&p.summary)).collect();
         // Scales with query length rather than a flat cutoff: 3 stray
         // characters ruin a 6-character query far more than an
         // 18-character one, so the tolerance should grow with what's
         // actually being typed instead of penalizing longer names for
         // their length.
         let max_distance = (query_lower.chars().count() / 3).clamp(2, 5);
-        let mut candidates: Vec<(usize, &PackageSummary)> = index
+        let mut candidates: Vec<(usize, &IndexedPackage)> = index
             .packages
             .iter()
-            .filter(|pkg| !existing.contains(&pkg.atom()))
-            .filter_map(|pkg| {
-                let distance = levenshtein(&pkg.name.to_lowercase(), &query_lower);
-                (distance <= max_distance).then_some((distance, pkg))
+            .filter(|p| !existing.contains(&Arc::as_ptr(&p.summary)))
+            .filter_map(|p| {
+                let distance = levenshtein(&p.name_lower, &query_lower);
+                (distance <= max_distance).then_some((distance, p))
             })
             .collect();
         candidates.sort_by_key(|(distance, _)| *distance);
@@ -302,10 +335,10 @@ pub fn search(query: &str) -> Result<Vec<PackageSummary>> {
         // room than the "did you mean" hint appended below a page of
         // otherwise-weak real hits.
         candidates.truncate(if results.is_empty() { 15 } else { 5 });
-        results.extend(candidates.into_iter().map(|(_, pkg)| pkg.clone()));
+        results.extend(candidates.into_iter().map(|(_, p)| p));
     }
 
-    Ok(results)
+    Ok(results.into_iter().map(|p| (*p.summary).clone()).collect())
 }
 
 /// How well a package matches the typed query, lower is better. Plain
@@ -314,14 +347,17 @@ pub fn search(query: &str) -> Result<Vec<PackageSummary>> {
 /// what turns that into an actual ranking, so typing "fire" surfaces
 /// `firefox` first instead of leaving it buried between `coldfire` and
 /// `wayfire-plugins-extra` in whatever order eix happened to return.
-fn relevance_rank(pkg: &PackageSummary, query: &str) -> u8 {
-    let query = query.to_lowercase();
-    let name = pkg.name.to_lowercase();
-    if name == query {
+///
+/// Takes already-lowercased `name`/`query` — every call site has one on
+/// hand (the index precomputes it, or the caller does once up front), so
+/// there's no reason for a function called once per comparison in a sort
+/// to redo that allocation itself.
+fn relevance_rank(name_lower: &str, query_lower: &str) -> u8 {
+    if name_lower == query_lower {
         0
-    } else if name.starts_with(&query) {
+    } else if name_lower.starts_with(query_lower) {
         1
-    } else if name.contains(&query) {
+    } else if name_lower.contains(query_lower) {
         2
     } else {
         // Only reachable via a description-only match — the name doesn't
@@ -444,16 +480,16 @@ pub fn list_categories(categories: &[&str]) -> Result<Vec<PackageSummary>> {
         return Ok(Vec::new());
     }
     let index = get_index()?;
-    let mut summaries: Vec<PackageSummary> =
-        index.packages.iter().filter(|pkg| categories.contains(&pkg.category.as_str())).cloned().collect();
-    summaries.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(summaries)
+    let mut summaries: Vec<&IndexedPackage> =
+        index.packages.iter().filter(|p| categories.contains(&p.summary.category.as_str())).collect();
+    summaries.sort_by(|a, b| a.summary.name.cmp(&b.summary.name));
+    Ok(summaries.into_iter().map(|p| (*p.summary).clone()).collect())
 }
 
 /// Look up a single package by its full atom (category/name).
 pub fn lookup(atom: &str) -> Result<Option<PackageSummary>> {
     let index = get_index()?;
-    Ok(index.packages.iter().find(|pkg| pkg.atom() == atom).cloned())
+    Ok(index.packages.iter().find(|p| p.summary.atom() == atom).map(|p| (*p.summary).clone()))
 }
 
 /// Every version of a package the tree currently offers, oldest first —
@@ -571,19 +607,14 @@ mod tests {
 
     #[test]
     fn exact_name_ranks_above_prefix_which_ranks_above_substring() {
-        assert!(relevance_rank(&pkg("www-client", "firefox"), "firefox") < relevance_rank(&pkg("app-misc", "firefox-decrypt"), "firefox"));
-        assert!(relevance_rank(&pkg("app-misc", "firefox-decrypt"), "firefox") < relevance_rank(&pkg("games-misc", "wayfire"), "fire"));
+        assert!(relevance_rank("firefox", "firefox") < relevance_rank("firefox-decrypt", "firefox"));
+        assert!(relevance_rank("firefox-decrypt", "firefox") < relevance_rank("wayfire", "fire"));
     }
 
     #[test]
     fn name_match_always_beats_description_only_match() {
-        let mut with_name_desc = pkg("app-misc", "coldfire");
-        with_name_desc.description = "unrelated".to_string();
-        let name_rank = relevance_rank(&with_name_desc, "fire");
-
-        let description_only = pkg("app-crypt", "bitwarden-desktop-bin");
-        let description_rank = relevance_rank(&description_only, "fire");
-
+        let name_rank = relevance_rank("coldfire", "fire");
+        let description_rank = relevance_rank("bitwarden-desktop-bin", "fire");
         assert!(name_rank < description_rank);
     }
 
