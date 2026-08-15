@@ -1,7 +1,7 @@
 use portage_store::portage::config_protect::{self, DiffSegment, PendingUpdate};
 use crate::ui::runtime;
 use adw::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// One row in the pending-updates list.
@@ -323,6 +323,67 @@ fn apply_resolution(
     );
 }
 
+/// Owns the reviewer dialog's list so it can be rebuilt in place from a
+/// fresh `config_protect::scan()` after every resolve action, instead of
+/// leaving the row for a file that was just resolved sitting in the list —
+/// `dispatch-conf`-style tools re-check the pending set on their own after
+/// each decision, and this used to just pop back to a list frozen at
+/// whatever it looked like when the dialog first opened.
+struct ReviewerState {
+    list: gtk::ListBox,
+    accept_all_button: gtk::Button,
+    nav: adw::NavigationView,
+    dialog: adw::Dialog,
+    /// The caller's own hook (refreshes the health banner/badge elsewhere
+    /// in the app) — called once per `populate`, i.e. once per actual
+    /// change to the pending set, not once per row click.
+    on_resolved: Rc<dyn Fn()>,
+    /// What `populate` last rendered, so `accept_all_button`'s click
+    /// handler always bulk-resolves the current set rather than whatever
+    /// was pending when the dialog first opened.
+    current: RefCell<Vec<PendingUpdate>>,
+}
+
+impl ReviewerState {
+    /// Re-scans `CONFIG_PROTECT` off the main thread and repopulates the
+    /// list from the result. Called after every resolve action (single
+    /// file or Accept All) so the dialog never shows a file that's already
+    /// been handled.
+    fn refresh(self: &Rc<Self>) {
+        let this = self.clone();
+        runtime::spawn_blocking(config_protect::scan, move |updates| this.populate(updates));
+    }
+
+    fn populate(self: &Rc<Self>, updates: Vec<PendingUpdate>) {
+        while let Some(child) = self.list.first_child() {
+            self.list.remove(&child);
+        }
+        let empty = updates.is_empty();
+        for update in &updates {
+            let row = update_row(update);
+            let update = update.clone();
+            let this = self.clone();
+            row.connect_activated(move |_| {
+                let this_for_resolve = this.clone();
+                push_resolver(&this.nav, update.clone(), Rc::new(move || this_for_resolve.refresh()));
+            });
+            self.list.append(&row);
+        }
+        // Only worth offering once there's more than one file to save a
+        // trip through — accepting a single pending update is exactly one
+        // click away already via its own row.
+        self.accept_all_button.set_visible(updates.len() > 1);
+        *self.current.borrow_mut() = updates;
+        (self.on_resolved)();
+        if empty {
+            // Nothing left to review — reflects what `dispatch-conf` would
+            // show as "no more updates," so there's nothing useful left
+            // for this dialog to stay open for.
+            self.dialog.close();
+        }
+    }
+}
+
 /// Opens the config-update reviewer: a list of every pending file across
 /// `CONFIG_PROTECT`, each opening its diff on click.
 pub fn present(anchor: &impl IsA<gtk::Widget>, updates: Vec<PendingUpdate>, on_resolved: Rc<dyn Fn()>) {
@@ -335,17 +396,6 @@ pub fn present(anchor: &impl IsA<gtk::Widget>, updates: Vec<PendingUpdate>, on_r
     list.set_selection_mode(gtk::SelectionMode::None);
 
     let nav = adw::NavigationView::new();
-
-    for update in &updates {
-        let row = update_row(update);
-        let update = update.clone();
-        let nav_for_click = nav.clone();
-        let on_resolved = on_resolved.clone();
-        row.connect_activated(move |_| {
-            push_resolver(&nav_for_click, update.clone(), on_resolved.clone());
-        });
-        list.append(&row);
-    }
 
     let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
     column.set_margin_top(16);
@@ -361,9 +411,6 @@ pub fn present(anchor: &impl IsA<gtk::Widget>, updates: Vec<PendingUpdate>, on_r
         .build();
 
     let header = adw::HeaderBar::new();
-    // Only worth offering once there's more than one file to save a trip
-    // through — accepting a single pending update is exactly one click
-    // away already via its own row.
     let accept_all_button = gtk::Button::with_label("Accept All");
     accept_all_button.set_tooltip_text(Some("Replace every pending file with its updated version"));
     accept_all_button.set_visible(updates.len() > 1);
@@ -385,12 +432,24 @@ pub fn present(anchor: &impl IsA<gtk::Widget>, updates: Vec<PendingUpdate>, on_r
     // absurdly wide on an ultrawide monitor.
     dialog.set_content_width((window.width() - 120).clamp(680, 1000));
 
+    let state = Rc::new(ReviewerState {
+        list,
+        accept_all_button: accept_all_button.clone(),
+        nav,
+        dialog: dialog.clone(),
+        on_resolved,
+        current: RefCell::new(Vec::new()),
+    });
+    // The caller already handed us the current pending set, so the first
+    // render doesn't need an extra scan/round-trip — only actions taken
+    // from here on go through `refresh`.
+    state.populate(updates);
+
     {
-        let updates = updates.clone();
-        let dialog = dialog.clone();
-        let on_resolved = on_resolved.clone();
+        let state = state.clone();
         accept_all_button.connect_clicked(move |button| {
             let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+            let updates = state.current.borrow().clone();
             let body = format!(
                 "This replaces all {} pending file(s) with the version portage proposed, discarding any local \
                  edits to them. Files with a merge you'd rather resolve by hand should be handled individually \
@@ -404,38 +463,30 @@ pub fn present(anchor: &impl IsA<gtk::Widget>, updates: Vec<PendingUpdate>, on_r
             confirm.set_default_response(Some("cancel"));
             confirm.set_close_response("cancel");
 
+            let state = state.clone();
             let updates = updates.clone();
-            let dialog = dialog.clone();
-            let on_resolved = on_resolved.clone();
             let button = button.clone();
             confirm.connect_response(None, move |_, response| {
                 if response != "accept" {
                     return;
                 }
                 button.set_sensitive(false);
+                let state = state.clone();
                 let updates = updates.clone();
-                let dialog = dialog.clone();
-                let on_resolved = on_resolved.clone();
                 let button = button.clone();
                 runtime::spawn_blocking(
                     move || config_protect::take_theirs_bulk(&updates).map_err(|e| e.to_string()),
                     move |result| {
-                        on_resolved();
-                        match result {
-                            Ok(()) => {
-                                dialog.close();
-                            }
-                            Err(_) => {
-                                // Left open rather than silently closing
-                                // over a failure — `bash`'s own `set -e`
-                                // means an early file failing leaves the
-                                // rest unapplied too, so there's nothing
-                                // partial to reconcile here, just "try
-                                // again" (or resolve the problem file by
-                                // hand first).
-                                button.set_sensitive(true);
-                            }
+                        button.set_sensitive(true);
+                        if result.is_ok() {
+                            state.refresh();
                         }
+                        // Left open rather than silently closing over a
+                        // failure — `bash`'s own `set -e` means an early
+                        // file failing leaves the rest unapplied too, so
+                        // there's nothing partial to reconcile here, just
+                        // "try again" (or resolve the problem file by hand
+                        // first).
                     },
                 );
             });

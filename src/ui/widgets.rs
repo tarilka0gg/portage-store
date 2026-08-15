@@ -257,6 +257,13 @@ pub struct CategoryGroup {
     pub name: &'static str,
     pub icon: &'static str,
     pub categories: &'static [&'static str],
+    /// Well-known apps from this group Papirus/hicolor ship a real icon
+    /// for — one is picked at random each time `category_tile` builds this
+    /// group's tile (i.e. once per app launch, since the landing page is
+    /// built once in `App::build` and never rebuilt), so the tile shows an
+    /// actual logo like Steam's instead of the generic symbolic glyph, and
+    /// which logo it is varies restart to restart.
+    pub icon_picks: &'static [&'static str],
 }
 
 /// The six activity-shaped groups GNOME Software uses. They're framed by
@@ -270,11 +277,13 @@ pub const CATEGORY_GROUPS: &[CategoryGroup] = &[
             "media-gfx", "media-sound", "media-video", "media-plugins", "media-tv",
             "media-radio", "media-fonts",
         ],
+        icon_picks: &["gimp", "blender", "krita", "inkscape", "kdenlive", "audacity", "obs"],
     },
     CategoryGroup {
         name: "Work",
         icon: "applications-office-symbolic",
         categories: &["app-office", "app-text", "app-editors", "app-backup", "net-print"],
+        icon_picks: &["libreoffice-writer", "libreoffice-calc", "thunderbird", "evolution", "gnucash"],
     },
     CategoryGroup {
         name: "Games",
@@ -286,6 +295,7 @@ pub const CATEGORY_GROUPS: &[CategoryGroup] = &[
             "games-simulation", "games-sports", "games-strategy", "games-util",
             "app-emulation",
         ],
+        icon_picks: &["steam", "lutris", "wine", "dolphin-emu", "supertuxkart", "0ad"],
     },
     CategoryGroup {
         name: "Communicate",
@@ -294,6 +304,7 @@ pub const CATEGORY_GROUPS: &[CategoryGroup] = &[
             "net-im", "net-mail", "net-irc", "net-voip", "net-nntp", "net-p2p",
             "net-ftp", "www-client",
         ],
+        icon_picks: &["telegram-desktop", "discord", "firefox", "signal-desktop", "chromium"],
     },
     CategoryGroup {
         name: "Learn",
@@ -303,6 +314,7 @@ pub const CATEGORY_GROUPS: &[CategoryGroup] = &[
             "sci-electronics", "sci-geosciences", "sci-libs", "sci-mathematics",
             "sci-physics", "sci-visualization",
         ],
+        icon_picks: &["stellarium", "kalzium", "marble", "octave", "kstars"],
     },
     CategoryGroup {
         name: "Develop",
@@ -312,6 +324,7 @@ pub const CATEGORY_GROUPS: &[CategoryGroup] = &[
             "dev-python", "dev-perl", "dev-ruby", "dev-java", "dev-db", "app-shells",
             "x11-terms",
         ],
+        icon_picks: &["code", "git-cola", "android-studio", "docker", "emacs"],
     },
 ];
 
@@ -514,9 +527,124 @@ fn papirus_symbolic_icon(name: &str) -> Option<gtk::Image> {
     Some(gtk::Image::from_paintable(Some(&paintable)))
 }
 
-/// A gradient category tile for the landing page.
+/// Picks one of `group.icon_picks` at random and resolves it to a real
+/// icon file plus a representative color sampled from it. `None` if the
+/// pick isn't in any installed icon theme, or the file GTK found isn't
+/// something `gdk_pixbuf` can decode (an SVG with no `librsvg` loader
+/// installed, for instance) — either way the caller falls back to the
+/// symbolic glyph and static gradient, so a miss here is never fatal.
+fn resolve_tile_icon(group: &CategoryGroup) -> Option<(std::path::PathBuf, (u8, u8, u8))> {
+    if group.icon_picks.is_empty() {
+        return None;
+    }
+    let pick_index = random_range(0, group.icon_picks.len() as u32 - 1) as usize;
+    let path = icons::resolve_by_name(group.icon_picks[pick_index])?;
+    let color = dominant_color(&path)?;
+    Some((path, color))
+}
+
+/// Averages the non-transparent, non-extreme pixels of a (downscaled)
+/// icon into a single RGB color — not a real dominant-color/quantization
+/// algorithm, just enough to give the tile background a tint that
+/// actually resembles its icon (Steam's blue, GIMP's grey-and-orange,
+/// ...) rather than a fixed palette that ignores which icon ended up
+/// there. Near-white/near-black/near-transparent pixels are skipped since
+/// most icons sit on a transparent or plain background that would
+/// otherwise wash the average toward grey.
+fn dominant_color(path: &std::path::Path) -> Option<(u8, u8, u8)> {
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file_at_size(path, 24, 24).ok()?;
+    let width = pixbuf.width();
+    let height = pixbuf.height();
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let n_channels = pixbuf.n_channels() as usize;
+    let has_alpha = pixbuf.has_alpha();
+    let rowstride = pixbuf.rowstride() as usize;
+    // Safe here despite the `unsafe` signature: this `Pixbuf` was just
+    // created above and never shared with anything else, so nothing else
+    // can be racing this read-only scan of its pixel buffer.
+    let pixels = unsafe { pixbuf.pixels() };
+
+    let (mut r_sum, mut g_sum, mut b_sum, mut count) = (0u64, 0u64, 0u64, 0u64);
+    for y in 0..height as usize {
+        let Some(row) = pixels.get(y * rowstride..) else { continue };
+        for x in 0..width as usize {
+            let Some(px) = row.get(x * n_channels..x * n_channels + n_channels) else { continue };
+            if has_alpha && px[3] < 32 {
+                continue;
+            }
+            let (r, g, b) = (px[0] as u32, px[1] as u32, px[2] as u32);
+            let is_extreme = (r > 235 && g > 235 && b > 235) || (r < 20 && g < 20 && b < 20);
+            if is_extreme {
+                continue;
+            }
+            r_sum += r as u64;
+            g_sum += g as u64;
+            b_sum += b as u64;
+            count += 1;
+        }
+    }
+    (count > 0).then(|| ((r_sum / count) as u8, (g_sum / count) as u8, (b_sum / count) as u8))
+}
+
+/// Turns a sampled icon color into the tile's two gradient stops. Icon
+/// colors run lighter, on average, than this app's existing hand-picked
+/// tile gradients — icons are drawn to read against either a light or a
+/// dark desktop background, while these tiles are always dark with a
+/// white label — so pale source colors get scaled down harder to keep
+/// that label legible no matter which icon was picked.
+fn tile_gradient_stops((r, g, b): (u8, u8, u8)) -> ((u8, u8, u8), (u8, u8, u8)) {
+    let luminance = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    let scale = if luminance > 150.0 { 0.55 } else { 0.8 };
+    let base = ((r as f32 * scale) as u8, (g as f32 * scale) as u8, (b as f32 * scale) as u8);
+    let dark = ((base.0 as f32 * 0.6) as u8, (base.1 as f32 * 0.6) as u8, (base.2 as f32 * 0.6) as u8);
+    (base, dark)
+}
+
+/// The CSS rule giving tile `index` its icon-derived gradient — a unique
+/// class per tile (`category-tile-dyn-N`) rather than reusing the static
+/// `category-tile-N` classes in `style.css`, so a tile whose icon lookup
+/// failed keeps using the static, hand-picked gradient instead of losing
+/// its background entirely.
+fn tile_gradient_css(index: usize, color: (u8, u8, u8)) -> String {
+    let (base, dark) = tile_gradient_stops(color);
+    format!(
+        ".category-tile-dyn-{index} {{ background-image: linear-gradient(160deg, #{:02x}{:02x}{:02x}, #{:02x}{:02x}{:02x}); }}\n",
+        base.0, base.1, base.2, dark.0, dark.1, dark.2
+    )
+}
+
+/// Registers generated CSS (the icon-derived tile gradients) with the
+/// default display, same mechanism `main.rs` uses for the static
+/// stylesheet — a second provider stacks fine at the same priority since
+/// the two never define the same class.
+fn apply_dynamic_css(css: &str) {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(css);
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+}
+
+/// A category tile for the landing page: an icon-derived gradient behind a
+/// real app icon (e.g. Steam's logo for Games) when one of the group's
+/// `icon_picks` resolves, falling back to the static hand-picked gradient
+/// and a symbolic glyph otherwise. Which pick wins is randomized once per
+/// call, and this is only ever called once per group at startup (see
+/// `App::build`), so the icon — and its tile color — varies from one
+/// launch to the next but stays put for the rest of the session.
 pub fn category_tile(index: usize, group: &CategoryGroup) -> gtk::Button {
-    let icon = papirus_symbolic_icon(group.icon).unwrap_or_else(|| gtk::Image::from_icon_name(group.icon));
+    let resolved = resolve_tile_icon(group);
+
+    let icon = match &resolved {
+        Some((path, _)) => {
+            let image = gtk::Image::from_file(path);
+            image.set_pixel_size(32);
+            image
+        }
+        None => papirus_symbolic_icon(group.icon).unwrap_or_else(|| gtk::Image::from_icon_name(group.icon)),
+    };
     let label = gtk::Label::new(Some(group.name));
     label.set_xalign(0.0);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -528,7 +656,13 @@ pub fn category_tile(index: usize, group: &CategoryGroup) -> gtk::Button {
 
     let button = gtk::Button::builder().child(&row).build();
     button.add_css_class("category-tile");
-    button.add_css_class(&format!("category-tile-{}", index % CATEGORY_GROUPS.len()));
+    match resolved {
+        Some((_, color)) => {
+            apply_dynamic_css(&tile_gradient_css(index, color));
+            button.add_css_class(&format!("category-tile-dyn-{index}"));
+        }
+        None => button.add_css_class(&format!("category-tile-{}", index % CATEGORY_GROUPS.len())),
+    }
     button
 }
 
