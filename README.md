@@ -123,20 +123,39 @@ portage-store-cli      # the same core, no window
 
 - **A single job queue.** Portage takes a global lock, so one `emerge` runs at a time
   and everything else waits its turn — reorderable and cancellable from a popover
-  without touching what's already running.
+  without touching what's already running. The whole queue can be **exported as a
+  POSIX shell script** (one `emerge`/helper invocation per queued job, in run order),
+  so what's queued can be handed to a different machine, `cron`, or just kept as a
+  record instead of only ever running through this app.
 - **Automatic conflict resolution.** A failed build that needs a USE flag, a keyword,
   a license acceptance, or a circular-dependency break is detected, explained, and
   offered as apply-and-retry.
+- **Toolchain blast-radius warning.** Before running an update that touches `gcc`,
+  `glibc`, or another toolchain component, a confirmation warns that this commonly
+  cascades into rebuilding everything linked against it, if free RAM also looks tight
+  for that at the current job count — one of several preflight checks (alongside a
+  stale tree and unreviewed config updates) shown before a big `@world` update, none
+  of which block it; they're every one dismissed together by choosing Continue.
 - **Live build output**, with a log drawer, an errors-only filter, and a searchable
   history of past builds.
 - **Build-time ETAs** from `qlop`'s own recorded merge history, counting down live.
 - **Resource throttling** (on by default): builds run under `nice`/`ionice` with a
   RAM-aware `MAKEOPTS` cap instead of whatever's in `make.conf`. Added after an
   unthrottled build genuinely OOM-killed unrelated processes during development.
-- **Night-only builds** (opt-in): queue things during the day, let them run at 23:00.
-- **Sandbox builds.** When a package won't resolve on the live system, build it in a
-  disposable chroot instead.
-- **Downgrades** from locally cached binary packages.
+- **Night-only builds** (opt-in): a mutating job queued outside the 23:00–07:00 window
+  waits instead of starting immediately, with a "Run Now" override always available if
+  it turns out you don't want to wait after all.
+- **Sandbox builds.** For a package the live system's resolver won't touch (a hard
+  mask, a keyword mask, a conflict) — builds it instead in a disposable, throttled
+  chroot: a shared stage3 base (fetched and checksum-verified once, so a second sandbox
+  build never re-downloads it) with the live portage tree bind-mounted **read-only**
+  and up to three pooled overlayfs instances, so a package that conflicts with whatever
+  was already built in one instance just overflows to a fresh one instead of failing
+  outright. The result lands in the same binary-package cache the host uses, so it's
+  installable afterward like any other cached binpkg.
+- **Downgrades**, installed straight from a locally cached binary package
+  (`--usepkgonly`, so it can never silently fall back to rebuilding from source) —
+  no network round-trip, no recompile.
 
 ### Knowing what's wrong
 
