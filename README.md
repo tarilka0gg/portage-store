@@ -1,5 +1,8 @@
 # Portage Store
 
+[![Latest release](https://img.shields.io/github/v/release/tarilka0gg/portage-store)](https://github.com/tarilka0gg/portage-store/releases/latest)
+[![License: GPL-2.0](https://img.shields.io/badge/license-GPL--2.0-blue)](LICENSE)
+
 A GTK4/libadwaita application store for Gentoo's Portage package manager, plus a
 terminal companion that shares the same core.
 
@@ -18,6 +21,20 @@ portage-store-cli      # the same core, no window
 > installing.
 
 ![The Explore landing page: category tiles above auto-advancing themed carousels](docs/screenshots/explore.png)
+
+---
+
+## Contents
+
+[Screenshots](#screenshots) ·
+[Features](#features) ·
+[Requirements](#requirements) ·
+[Installing](#installing) ·
+[Privilege model](#the-privilege-model--read-this) ·
+[The CLI](#the-cli) ·
+[Architecture](#architecture) ·
+[Development](#development) ·
+[Packaging](#packaging)
 
 ---
 
@@ -97,7 +114,10 @@ portage-store-cli      # the same core, no window
   suggests close names instead of returning an empty page.
 - **Search operators** — `cat:games-*`, `use:wayland`, `installed:true`, `@world` —
   applied in memory, so changing one re-renders instantly.
-- **Curated category tiles** and a landing page of themed carousels.
+- **Curated category tiles** — each showing a real app icon (Steam for Games,
+  GIMP or Blender for Create, ...) picked at random from that category's pool on every
+  launch, with the tile's own gradient drawn from that icon's color — above a landing
+  page of themed carousels.
 
 ### Installing and managing
 
@@ -180,6 +200,7 @@ collapsed strip beneath the Portage results, never mixed into them.
 | `equery` | `app-portage/gentoolkit` | reverse dependencies |
 | `qlop` | `app-portage/portage-utils` | build-time history / ETAs |
 | `eclean-dist`, `eclean-pkg` | `app-portage/gentoolkit` | cache cleanup |
+| `eselect` | `app-admin/eselect` | unread news, kernel symlink selection |
 | `doas` | `app-admin/doas` | the privilege helper (see below) |
 | `curl`, `git`, `tar`, `df`, `man` | base system | artwork, config history, bundles |
 | `flatpak` | `sys-apps/flatpak` | *optional* — the Flatpak lane auto-disables without it |
