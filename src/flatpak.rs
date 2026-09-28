@@ -50,6 +50,42 @@ fn has_any_remote() -> bool {
     false
 }
 
+/// The base directories Flatpak keeps its own AppStream cache under, user
+/// scope before system scope — a user-level remote can shadow a
+/// system-level one, so its icon cache should win the same way.
+fn appstream_bases() -> Vec<std::path::PathBuf> {
+    let mut bases = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        bases.push(std::path::PathBuf::from(home).join(".local/share/flatpak/appstream"));
+    }
+    bases.push(std::path::PathBuf::from("/var/lib/flatpak/appstream"));
+    bases
+}
+
+/// A local, already-on-disk icon for a search hit, if `flatpak update
+/// --appstream` (run automatically alongside a normal sync/search by
+/// Flatpak itself) has ever cached one for `remote` — the same cache
+/// GNOME Software reads from for its own search results. Never touches
+/// the network: a search hit with nothing cached yet just gets the same
+/// generic fallback icon a Portage package with no artwork does.
+pub fn icon_path(remote: &str, app_id: &str) -> Option<std::path::PathBuf> {
+    find_icon_in_bases(&appstream_bases(), std::env::consts::ARCH, remote, app_id)
+}
+
+/// The actual search, factored out so tests can point it at a fixture
+/// tree instead of the real `HOME`/`/var/lib/flatpak` locations.
+fn find_icon_in_bases(bases: &[std::path::PathBuf], arch: &str, remote: &str, app_id: &str) -> Option<std::path::PathBuf> {
+    for base in bases {
+        for size in ["128x128", "64x64"] {
+            let candidate = base.join(remote).join(arch).join("active/icons").join(size).join(format!("{app_id}.png"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// Parses a human-readable size (`"99.6 MB"`, `"3.3 kB"`, `"1.2 GB"`,
 /// as `flatpak remote-info`/`flatpak list` print them) into KiB — the
 /// same unit the rest of the app already sizes downloads in (see
@@ -131,7 +167,14 @@ pub fn installed() -> Result<HashMap<String, InstalledFlatpak>> {
 /// not an error — some entries (runtimes already satisfied locally)
 /// legitimately have nothing to download.
 pub fn remote_info_size(remote: &str, app_id: &str) -> Option<(Option<u64>, Option<u64>)> {
-    let output = Command::new("flatpak").args(["remote-info", remote, app_id]).output().ok()?;
+    // `--user` is required, not optional, here: a system left with `flathub`
+    // configured at both `--user` and `--system` scope (not unusual — the
+    // GeForce NOW/Steam-style installers add a system-wide remote) makes a
+    // scope-less `flatpak remote-info` ambiguous, and it responds by
+    // prompting interactively rather than picking one — which, run
+    // non-interactively the way this app always does, just fails outright,
+    // silently turning every download-size lookup into "Unknown".
+    let output = Command::new("flatpak").args(["remote-info", SCOPE, remote, app_id]).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -250,5 +293,54 @@ mod tests {
     fn non_progress_lines_are_not_mistaken_for_progress() {
         assert!(parse_progress("Looking for matches…").is_none());
         assert!(parse_progress("Installation complete.").is_none());
+    }
+
+    fn temp_appstream_root() -> std::path::PathBuf {
+        let unique =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
+        std::env::temp_dir().join(format!("portage-store-flatpak-icon-test-{unique}"))
+    }
+
+    fn write_icon(base: &std::path::Path, remote: &str, arch: &str, size: &str, app_id: &str) {
+        let dir = base.join(remote).join(arch).join("active/icons").join(size);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{app_id}.png")), b"fake png").unwrap();
+    }
+
+    #[test]
+    fn finds_a_128_icon_over_a_64_one() {
+        let root = temp_appstream_root();
+        write_icon(&root, "flathub", "x86_64", "128x128", "org.mozilla.firefox");
+        write_icon(&root, "flathub", "x86_64", "64x64", "org.mozilla.firefox");
+        let found = find_icon_in_bases(&[root.clone()], "x86_64", "flathub", "org.mozilla.firefox");
+        assert_eq!(found, Some(root.join("flathub/x86_64/active/icons/128x128/org.mozilla.firefox.png")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_64_when_128_is_missing() {
+        let root = temp_appstream_root();
+        write_icon(&root, "flathub", "x86_64", "64x64", "org.gimp.GIMP");
+        let found = find_icon_in_bases(&[root.clone()], "x86_64", "flathub", "org.gimp.GIMP");
+        assert_eq!(found, Some(root.join("flathub/x86_64/active/icons/64x64/org.gimp.GIMP.png")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_user_scope_base_is_preferred_over_a_later_one() {
+        let user_root = temp_appstream_root();
+        let system_root = temp_appstream_root();
+        write_icon(&user_root, "flathub", "x86_64", "128x128", "org.gimp.GIMP");
+        write_icon(&system_root, "flathub", "x86_64", "128x128", "org.gimp.GIMP");
+        let found = find_icon_in_bases(&[user_root.clone(), system_root.clone()], "x86_64", "flathub", "org.gimp.GIMP");
+        assert_eq!(found, Some(user_root.join("flathub/x86_64/active/icons/128x128/org.gimp.GIMP.png")));
+        std::fs::remove_dir_all(&user_root).unwrap();
+        std::fs::remove_dir_all(&system_root).unwrap();
+    }
+
+    #[test]
+    fn nothing_cached_is_not_an_error() {
+        let root = temp_appstream_root();
+        assert_eq!(find_icon_in_bases(&[root], "x86_64", "flathub", "org.gimp.GIMP"), None);
     }
 }

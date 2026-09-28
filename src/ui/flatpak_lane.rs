@@ -11,9 +11,11 @@ impl App {
     /// Reconciles a Flatpak search's hits against the Portage results
     /// already on screen (`backend::merge_search_results`): pins a
     /// "Also on Flatpak" chip onto every card with a confident match, and
-    /// renders the rest as a collapsed section beneath the grid. Never
-    /// touches `results_grid` itself — see `run_search` for why that
-    /// matters.
+    /// renders the rest as a card grid beneath the Portage results — the
+    /// same `package_card`/`grid()` treatment those get, via
+    /// `widgets::flatpak_card`, not a visually separate secondary list.
+    /// Never touches `results_grid` itself — see `run_search` for why
+    /// that matters.
     pub(super) fn apply_flatpak_results(self: &Rc<Self>, hits: Vec<flatpak::FlatpakApp>, installed: HashMap<String, flatpak::InstalledFlatpak>) {
         let merged = backend::merge_search_results(&self.last_results.borrow(), &hits);
         let cards = self.search_cards.borrow();
@@ -29,23 +31,20 @@ impl App {
         if merged.flatpak_only.is_empty() {
             return;
         }
-        let boxed_list = gtk::ListBox::new();
-        boxed_list.add_css_class("boxed-list");
-        let expander = adw::ExpanderRow::builder()
-            .title(format!("Also available via Flatpak ({})", merged.flatpak_only.len()))
-            .build();
+        let heading = widgets::section_heading(&format!("Also available via Flatpak ({})", merged.flatpak_only.len()));
+        let grid = widgets::grid();
         for app in &merged.flatpak_only {
             let already_installed = installed.contains_key(&app.app_id);
-            let row = widgets::flatpak_only_row(app, already_installed);
+            let card = widgets::flatpak_card(app, already_installed);
             if !already_installed {
                 let app_for_click = app.clone();
                 let this = self.clone();
-                row.connect_activated(move |_| this.present_flatpak_detail(app_for_click.clone()));
+                card.connect_clicked(move |_| this.present_flatpak_detail(app_for_click.clone()));
             }
-            expander.add_row(&row);
+            grid.insert(&card, -1);
         }
-        boxed_list.append(&expander);
-        self.flatpak_section.append(&boxed_list);
+        self.flatpak_section.append(&heading);
+        self.flatpak_section.append(&grid);
     }
 
     /// Like `clear_flatpak_section`, but leaves `flatpak_chips` alone —
@@ -58,67 +57,57 @@ impl App {
         }
     }
 
-    /// Opens a small confirm-and-install dialog for a Flatpak-only search
-    /// hit. Deliberately not routed through `detail.rs` — that page is
-    /// built entirely around Portage concepts (USE flags, `--pretend`
-    /// previews, sandbox builds) that don't apply here, and forcing a
-    /// Flatpak app through it would mean either a page half full of
-    /// disabled Portage-only controls or a much larger rewrite of that
-    /// page than this pass is scoped for.
+    /// Opens a real navigation page for a Flatpak-only search hit — the
+    /// same "push a page" treatment `browse::open_detail` gives a Portage
+    /// package, via `flatpak_detail::build`. That page is deliberately
+    /// much smaller than `detail.rs`'s (no USE flags, no `--pretend`
+    /// preview, no sandbox builds — none of that applies to a Flatpak
+    /// app), not a cut-down copy of it.
     pub(super) fn present_flatpak_detail(self: &Rc<Self>, app: flatpak::FlatpakApp) {
-        // Fetched before the dialog even opens — showing "Install" with
-        // no size, then having a 1-2 GB runtime download turn out to be
-        // part of it, is exactly the "your warning will lie" failure
-        // mode a Flatpak-aware download size figure exists to avoid.
+        // Pushed immediately so there's something to look at while the
+        // lookups below are in flight — same pattern `browse::open_detail`
+        // uses while `eix::lookup` runs.
+        let loading_page = loading_navigation_page();
+        self.nav.push(&loading_page);
+
         let this = self.clone();
         let app_for_lookup = app.clone();
         runtime::spawn_blocking(
-            move || flatpak::remote_info_size(&app_for_lookup.remote, &app_for_lookup.app_id).and_then(|(download, _)| download),
-            move |download_kib| this.present_flatpak_confirm(app.clone(), download_kib),
+            move || {
+                let download_kib = flatpak::remote_info_size(&app_for_lookup.remote, &app_for_lookup.app_id).and_then(|(download, _)| download);
+                let flathub = portage_store::portage::flathub::lookup_by_app_id(&app_for_lookup.app_id);
+                (download_kib, flathub)
+            },
+            move |(download_kib, flathub)| {
+                let install_app = this.clone();
+                let page = flatpak_detail::build(
+                    &app,
+                    download_kib,
+                    flathub,
+                    Rc::new(move |app: flatpak::FlatpakApp| install_app.install_flatpak(app)),
+                );
+                this.nav.pop();
+                this.nav.push(&page);
+            },
         );
     }
 
-    pub(super) fn present_flatpak_confirm(self: &Rc<Self>, app: flatpak::FlatpakApp, download_kib: Option<u64>) {
-        // Driven by `Caps`, not hardcoded prose about Flatpak specifically
-        // — this is exactly the sentence that would need to change (or
-        // vanish) if a third, root-needing backend ever reused this same
-        // confirm dialog.
-        let caps = backend::SourceId::Flatpak.caps();
-        let trust_line = if caps.sandboxed && !caps.needs_root {
-            "Installs sandboxed, as your own user — no admin password needed."
-        } else {
-            "Installs on this system."
-        };
-        let mut body = if app.description.is_empty() { trust_line.to_string() } else { format!("{}\n\n{trust_line}", app.description) };
-        if let Some(kib) = download_kib {
-            body.push_str(&format!("\n\nDownload size: {} (may include a shared runtime not yet on this machine).", emerge::format_size_kib(kib)));
-        }
-        let dialog = adw::AlertDialog::new(Some(&app.name), Some(&body));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("install", "Install");
-        dialog.set_response_appearance("install", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("install"));
-        dialog.set_close_response("cancel");
-
+    /// Sets up `flathub` (if it isn't already) and queues the actual
+    /// install — the click handler behind the detail page's Install
+    /// button, previously the response handler on the confirm dialog this
+    /// page replaced.
+    fn install_flatpak(self: &Rc<Self>, app: flatpak::FlatpakApp) {
         let this = self.clone();
-        dialog.connect_response(None, move |_, response| {
-            if response != "install" {
-                return;
-            }
-            let this = this.clone();
-            let app = app.clone();
-            runtime::spawn_blocking(
-                move || flatpak::ensure_user_flathub().map(|()| app).map_err(|e| e.to_string()),
-                move |result| match result {
-                    Ok(app) => this.enqueue_flatpak(FlatpakQueueEntry {
-                        job: flatpak::install_job(&app.remote, &app.app_id),
-                        label: format!("Installing {} (Flatpak)", app.name),
-                    }),
-                    Err(err) => this.toast(&format!("Couldn't set up Flatpak: {err}")),
-                },
-            );
-        });
-        dialog.present(Some(&self.window));
+        runtime::spawn_blocking(
+            move || flatpak::ensure_user_flathub().map(|()| app).map_err(|e| e.to_string()),
+            move |result| match result {
+                Ok(app) => this.enqueue_flatpak(FlatpakQueueEntry {
+                    job: flatpak::install_job(&app.remote, &app.app_id),
+                    label: format!("Installing {} (Flatpak)", app.name),
+                }),
+                Err(err) => this.toast(&format!("Couldn't set up Flatpak: {err}")),
+            },
+        );
     }
 
     pub(super) fn enqueue_flatpak(self: &Rc<Self>, entry: FlatpakQueueEntry) {

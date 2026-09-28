@@ -367,7 +367,7 @@ fn watch_github_preview_toggle(screenshot_slot: &gtk::Box, url: String) {
     });
 }
 
-fn screenshot_carousel(urls: &[String]) -> gtk::Widget {
+pub(super) fn screenshot_carousel(urls: &[String]) -> gtk::Widget {
     let carousel = adw::Carousel::new();
     carousel.set_height_request(340);
     carousel.set_spacing(12);
@@ -993,7 +993,7 @@ fn present_learn_more(anchor: &impl IsA<gtk::Widget>, display_name: &str, conten
     dialog.present(Some(&window));
 }
 
-fn link_row(icon_name: &str, title: &str, url: &str) -> adw::ActionRow {
+pub(super) fn link_row(icon_name: &str, title: &str, url: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder().title(title).subtitle(url).build();
     row.add_prefix(&gtk::Image::from_icon_name(icon_name));
     let open = gtk::Image::from_icon_name("adw-external-link-symbolic");

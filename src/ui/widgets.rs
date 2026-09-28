@@ -372,24 +372,57 @@ pub fn package_image(
         .or_else(|| icons::resolve_cached(name));
 
     if let Some(path) = resolved {
-        let image = gtk::Image::from_file(path);
-        image.set_pixel_size(size);
-        // Same footprint as the fallback below, so text starts at the same
-        // x whether or not the package turned out to have real artwork.
-        image.set_size_request(size, size);
-        return image;
+        return real_icon_image(path, size);
     }
 
-    // Sized directly rather than wrapped in a box: GtkImage already centres
-    // its icon inside its own allocation. The wrapper this replaces needed
-    // an expanding child to centre, and expand flags propagate *upwards* —
-    // which quietly turned the icon into a stretchy column that slid by a
-    // different amount on every card, staggering the whole list.
-    let image = gtk::Image::from_icon_name(fallback_icon_name(category));
+    fallback_icon_image(fallback_icon_name(category), size)
+}
+
+/// A real icon file, loaded and sized for a grid card.
+fn real_icon_image(path: std::path::PathBuf, size: i32) -> gtk::Image {
+    let image = gtk::Image::from_file(path);
+    image.set_pixel_size(size);
+    // Same footprint as `fallback_icon_image`, so text starts at the same
+    // x whether or not the package turned out to have real artwork.
+    image.set_size_request(size, size);
+    image
+}
+
+/// A symbolic placeholder in the same footprint a real icon would take —
+/// shared by `package_image` (a category glyph) and `flatpak_card` (a
+/// generic one, since a Flatpak app has no Portage category to key off).
+///
+/// Sized directly rather than wrapped in a box: GtkImage already centres
+/// its icon inside its own allocation. The wrapper this replaces needed an
+/// expanding child to centre, and expand flags propagate *upwards* — which
+/// quietly turned the icon into a stretchy column that slid by a different
+/// amount on every card, staggering the whole list.
+fn fallback_icon_image(icon_name: &str, size: i32) -> gtk::Image {
+    let image = gtk::Image::from_icon_name(icon_name);
     image.set_pixel_size((size as f32 * 0.55) as i32);
     image.set_size_request(size, size);
     image.add_css_class("icon-fallback");
     image
+}
+
+/// Hard-caps `s` to `max_chars`, truncating the string content itself
+/// rather than trusting `GtkLabel`'s own `ellipsize`/`wrap`+`max-width-chars`
+/// to bound its natural width. Belt-and-suspenders: those properties
+/// *should* be enough on their own, but a homogeneous `FlowBox` sizes
+/// every column to its single widest child, so the one real-world ebuild
+/// description with an unbroken 40+ character run (a `cross-platform/
+/// cross-toolkit/cross-desktop`-shaped slash-joined phrase, no spaces for
+/// wrapping to break at) was enough to blow every card in a results grid
+/// out to full width and collapse the whole grid to one column — this
+/// removes any dependency on Pango behaving exactly as expected for that
+/// case by never handing it text long enough for the question to matter.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut truncated: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
 }
 
 /// One clickable app card in a browse grid: icon, name, one-line summary —
@@ -411,18 +444,18 @@ pub fn package_card(
     // sizes its columns from each child's *natural* width, so an unbounded
     // one-line description would make every card demand the full row and
     // collapse the grid to a single column.
-    let title = gtk::Label::new(Some(&pkg.name));
+    let title = gtk::Label::new(Some(&truncate_chars(&pkg.name, 18)));
     title.set_xalign(0.0);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.set_max_width_chars(20);
+    title.set_max_width_chars(18);
     title.add_css_class("package-card-title");
 
-    let subtitle = gtk::Label::new(Some(&pkg.description));
+    let subtitle = gtk::Label::new(Some(&truncate_chars(&pkg.description, 90)));
     subtitle.set_xalign(0.0);
     subtitle.set_wrap(true);
     subtitle.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     subtitle.set_lines(2);
-    subtitle.set_max_width_chars(22);
+    subtitle.set_max_width_chars(20);
     subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
     subtitle.add_css_class("dim-label");
     // `set_lines(2)` only caps wrapping at 2 lines, it doesn't reserve
@@ -446,7 +479,16 @@ pub fn package_card(
     // Fill, not the button's default centring: with centred content each
     // card's icon starts wherever its own text happens to end, so a column
     // of cards comes out visibly staggered.
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    //
+    // Tighter than `flatpak_card`'s row (10 vs. 14) since this row also
+    // carries the installed checkmark *and* the Flatpak chip below —
+    // `flatpak_card` only ever has the one trailing chip, so it needs
+    // less breathing room between children to land at the same total
+    // width; without this, this card was consistently wider than
+    // `flatpak_card`'s despite both grids sharing the exact same column
+    // budget, so a window narrow enough for the Flatpak-only section to
+    // show two columns could still force the Portage results down to one.
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     row.set_halign(gtk::Align::Fill);
     row.append(&icon);
     row.append(&text);
@@ -460,10 +502,36 @@ pub fn package_card(
     // where none (or all) of them do, and a grid landing just over the
     // three-column threshold would silently fall back to two.
     let check = gtk::Image::from_icon_name("object-select-symbolic");
+    check.set_pixel_size(16);
     check.set_valign(gtk::Align::Center);
     check.set_tooltip_text(Some("Installed"));
     check.set_opacity(if installed.contains_key(&pkg.atom()) { 1.0 } else { 0.0 });
     row.append(&check);
+
+    // Same "always present, just invisible" reasoning as `check` just
+    // above — and for the exact same reason: `add_flatpak_chip` used to
+    // *insert* this only onto cards with a confident match, which is
+    // precisely the "only some cards in a grid carry this" case the
+    // comment above warns about. It wasn't hypothetical: a search whose
+    // results included even one confidently-matched card was enough to
+    // widen every column in the whole grid and collapse it to a single
+    // one. Reserving the space unconditionally and only toggling opacity
+    // (`add_flatpak_chip`, below) means every card in a grid is always
+    // exactly the same width regardless of which ones actually match.
+    // Short badge text ("Flatpak", matching `flatpak_card`'s own chip),
+    // not the longer "Also on Flatpak" this used to say — reserving space
+    // for the fuller phrase on every single card (needed either way, per
+    // the comment above) was, on its own, enough extra width to push
+    // every results grid down to one column permanently, matched or not.
+    // `set_width_chars` locks this label's own width to that many
+    // characters regardless of opacity state, so revealing it never
+    // changes the card's width the way switching its *text* would.
+    let flatpak_chip = gtk::Label::new(Some(portage_store::backend::SourceId::Flatpak.label()));
+    flatpak_chip.add_css_class("source-chip");
+    flatpak_chip.set_valign(gtk::Align::Center);
+    flatpak_chip.set_width_chars(7);
+    flatpak_chip.set_opacity(0.0);
+    row.append(&flatpak_chip);
 
     let button = gtk::Button::builder().child(&row).build();
     button.add_css_class("card");
@@ -472,38 +540,79 @@ pub fn package_card(
     (button, icon)
 }
 
-/// Adds a small "Also on Flatpak" pill to an already-built `package_card`
-/// — purely additive metadata on a card that's still, fundamentally, the
-/// Portage result. Called only when `backend::merge_search_results` found
-/// a confident match, never unconditionally, so a card never claims a
-/// Flatpak build exists when the merge wasn't sure enough to say so.
+/// Reveals the "Also on Flatpak" pill `package_card` already reserved
+/// space for (always present at opacity 0 — see the comment there) —
+/// called only when `backend::merge_search_results` found a confident
+/// match, never unconditionally, so a card never claims a Flatpak build
+/// exists when the merge wasn't sure enough to say so.
 pub fn add_flatpak_chip(card: &gtk::Button) {
     let Some(row) = card.child().and_downcast::<gtk::Box>() else { return };
-    let chip = gtk::Label::new(Some(&format!("Also on {}", portage_store::backend::SourceId::Flatpak.label())));
-    chip.add_css_class("source-chip");
-    chip.set_valign(gtk::Align::Center);
-    row.insert_child_after(&chip, row.last_child().as_ref());
+    let Some(chip) = row.last_child().and_downcast::<gtk::Label>() else { return };
+    chip.set_opacity(1.0);
 }
 
 /// A card for a Flatpak-only search hit — the "Also available via
-/// Flatpak" section's own rows, which never had a Portage result to piggy
-/// back a chip onto. Deliberately a plainer `ActionRow`, not a full grid
-/// card: this section is meant to read as a secondary, optional list
-/// tucked below the real (Portage) results, not visually competing with
-/// them for attention.
-pub fn flatpak_only_row(app: &portage_store::flatpak::FlatpakApp, already_installed: bool) -> adw::ActionRow {
-    let row = adw::ActionRow::builder().title(&app.name).subtitle(&app.description).build();
-    row.add_prefix(&gtk::Image::from_icon_name("package-x-generic-symbolic"));
+/// Flatpak" section's own cards, built to the same shape `package_card`
+/// uses for Portage results (icon, title, 2-line description, in the same
+/// `grid()` FlowBox) rather than a visually separate treatment, since a
+/// Flatpak-only hit is just as much a real result as a Portage one.
+///
+/// The icon comes from Flatpak's own local AppStream icon cache
+/// (`flatpak::icon_path` — the same cache GNOME Software reads, never a
+/// network fetch) when one's been cached for this remote, falling back to
+/// a generic placeholder otherwise — a Flatpak app has no Portage
+/// category to pick a more specific fallback glyph from.
+pub fn flatpak_card(app: &portage_store::flatpak::FlatpakApp, already_installed: bool) -> gtk::Button {
+    const SIZE: i32 = 64;
+    let icon = match portage_store::flatpak::icon_path(&app.remote, &app.app_id) {
+        Some(path) => real_icon_image(path, SIZE),
+        None => fallback_icon_image("package-x-generic-symbolic", SIZE),
+    };
+    icon.set_valign(gtk::Align::Center);
+
+    let title = gtk::Label::new(Some(&truncate_chars(&app.name, 20)));
+    title.set_xalign(0.0);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.set_max_width_chars(20);
+    title.add_css_class("package-card-title");
+
+    let subtitle = gtk::Label::new(Some(&truncate_chars(&app.description, 90)));
+    subtitle.set_xalign(0.0);
+    subtitle.set_wrap(true);
+    subtitle.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    subtitle.set_lines(2);
+    subtitle.set_max_width_chars(22);
+    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    subtitle.add_css_class("dim-label");
+    subtitle.add_css_class("package-card-subtitle");
+
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    text.set_valign(gtk::Align::Center);
+    text.set_hexpand(true);
+    text.append(&title);
+    text.append(&subtitle);
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    row.set_halign(gtk::Align::Fill);
+    row.append(&icon);
+    row.append(&text);
+
     let chip_text = if already_installed { "Installed".to_string() } else { portage_store::backend::SourceId::Flatpak.label().to_string() };
     let chip = gtk::Label::new(Some(&chip_text));
     chip.add_css_class("source-chip");
     chip.set_valign(gtk::Align::Center);
-    row.add_suffix(&chip);
-    // Already-installed rows aren't a "tap to install" affordance —
-    // this pass has no uninstall/manage flow for Flatpak apps yet, so
-    // there's nothing useful for a tap to do here.
-    row.set_activatable(!already_installed);
-    row
+    row.append(&chip);
+
+    let button = gtk::Button::builder().child(&row).build();
+    button.add_css_class("card");
+    button.add_css_class("package-card");
+    button.set_tooltip_text(Some(&app.app_id));
+    // Already-installed cards aren't a "tap to install" affordance — this
+    // app has no Flatpak uninstall/manage flow yet, so there's nothing
+    // useful for a tap to do here. Left in the grid (not hidden) so the
+    // count in the section heading still matches what's actually shown.
+    button.set_sensitive(!already_installed);
+    button
 }
 
 /// Loads `name` straight from Papirus's own symbolic category icons rather
@@ -666,13 +775,15 @@ pub fn category_tile(index: usize, group: &CategoryGroup) -> gtk::Button {
     button
 }
 
-/// A responsive grid that reflows from 3 columns down to 1 as the window
-/// narrows, matching GNOME Software's behaviour.
+/// A responsive grid that reflows from 2 columns down to 1 as the window
+/// narrows — used for every card grid in the app (Explore tiles, search
+/// results, the Flatpak-only section, Installed), so all of them share
+/// exactly the same layout instead of drifting apart.
 pub fn grid() -> gtk::FlowBox {
     let flow = gtk::FlowBox::new();
     flow.set_selection_mode(gtk::SelectionMode::None);
     flow.set_homogeneous(true);
-    flow.set_max_children_per_line(3);
+    flow.set_max_children_per_line(2);
     flow.set_min_children_per_line(1);
     flow.set_column_spacing(12);
     flow.set_row_spacing(12);
@@ -699,6 +810,39 @@ pub fn clear(flow: &gtk::FlowBox) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_chars_leaves_short_strings_untouched() {
+        assert_eq!(truncate_chars("firefox", 20), "firefox");
+        assert_eq!(truncate_chars("exactly-ten", 11), "exactly-ten");
+    }
+
+    #[test]
+    fn truncate_chars_cuts_long_strings_with_an_ellipsis() {
+        // 20 real characters kept, then one more slot spent on the
+        // ellipsis itself — the whole point is the *result* never exceeds
+        // `max_chars`, not that exactly `max_chars` of original text
+        // survives.
+        let truncated = truncate_chars("gnome-shell-extension-desktop-icons-ng", 20);
+        assert_eq!(truncated.chars().count(), 20);
+        assert!(truncated.ends_with('…'));
+        assert_eq!(truncated, "gnome-shell-extensi…");
+    }
+
+    #[test]
+    fn truncate_chars_handles_one_unbroken_run_with_no_spaces() {
+        // The exact real-world shape that used to defeat GtkLabel's own
+        // wrap/ellipsize sizing and collapse a whole results grid to one
+        // column — see `truncate_chars`'s own doc comment.
+        let truncated = truncate_chars("cross-platform/cross-toolkit/cross-desktop", 22);
+        assert_eq!(truncated.chars().count(), 22);
+    }
+
+    #[test]
+    fn truncate_chars_is_a_no_op_exactly_at_the_boundary() {
+        let s = "a".repeat(20);
+        assert_eq!(truncate_chars(&s, 20), s);
+    }
 
     #[test]
     fn random_range_stays_within_bounds() {

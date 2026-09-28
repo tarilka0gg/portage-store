@@ -8,6 +8,7 @@ mod cleanup;
 mod config_update;
 mod depclean;
 mod detail;
+mod flatpak_detail;
 mod flatpak_lane;
 mod health;
 mod kernel_page;
@@ -853,7 +854,7 @@ impl App {
         // stays exclusively Portage's. Empty (and so invisible — a
         // `gtk::Box` with no children takes up no space) until a search
         // actually turns up something Flatpak-only.
-        let flatpak_section = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let flatpak_section = gtk::Box::new(gtk::Orientation::Vertical, 10);
         flatpak_section.set_margin_top(16);
 
         let results = page_box();
@@ -1907,6 +1908,12 @@ impl App {
                 // build the wrap-loop clones appended below.
                 let build_page = |page_picks: &[PackageSummary], icon_queue: &mut HashMap<String, Vec<gtk::Image>>| {
                     let flow = widgets::grid();
+                    // Fixed at 3 columns regardless of `grid()`'s own
+                    // default: this carousel page is always built from
+                    // exactly six picks (see below) laid out 3x2, and that
+                    // shape is what the wrap-loop/page-sizing logic around
+                    // it assumes.
+                    flow.set_max_children_per_line(3);
                     // Without this, AdwCarousel sizes each page to its
                     // child's *natural* width rather than the carousel's
                     // own — since a 3x2 grid's natural width is narrower

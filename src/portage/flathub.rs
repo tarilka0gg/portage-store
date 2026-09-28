@@ -23,6 +23,15 @@ pub struct FlathubApp {
     pub description: String,
     pub icon: Option<String>,
     pub screenshots: Vec<String>,
+    // `#[serde(default)]` so a cache file written before these fields
+    // existed still deserializes (as `None`) instead of erroring out and
+    // forcing every previously-cached entry to look like a cache miss.
+    #[serde(default)]
+    pub project_license: Option<String>,
+    #[serde(default)]
+    pub developer_name: Option<String>,
+    #[serde(default)]
+    pub homepage: Option<String>,
 }
 
 /// Cached lookups, including misses. A miss is by far the common case —
@@ -235,6 +244,58 @@ pub fn lookup(package_name: &str) -> Option<FlathubApp> {
     app
 }
 
+/// Looks a Flatpak app up by its own exact `app_id` — used for a genuine
+/// Flatpak search hit, which already carries one, rather than `lookup`'s
+/// name-based fuzzy match (built for the opposite direction: enriching a
+/// *Portage* package's page with Flathub's screenshots when there's no
+/// app_id to go on at all, only a package name to guess from). Skips the
+/// search step entirely: `{APPSTREAM_URL}/{app_id}` alone already carries
+/// name/summary/description/icon/screenshots.
+pub fn lookup_by_app_id(app_id: &str) -> Option<FlathubApp> {
+    if let Some(entry) = read_cache(app_id) {
+        return match entry {
+            CacheEntry::Found(app) => Some(app),
+            CacheEntry::Missing => None,
+        };
+    }
+    let app = fetch_by_app_id(app_id);
+    write_cache(
+        app_id,
+        &match &app {
+            Some(app) => CacheEntry::Found(app.clone()),
+            None => CacheEntry::Missing,
+        },
+    );
+    app
+}
+
+/// License, developer, and homepage — the same per-app AppStream payload
+/// both `fetch` and `fetch_by_app_id` already download for its
+/// `screenshots` key carries all three, so reading them costs nothing
+/// extra: no second request either caller doesn't already make.
+fn appstream_extras(appstream: &serde_json::Value) -> (Option<String>, Option<String>, Option<String>) {
+    let project_license = appstream.get("project_license").and_then(|v| v.as_str()).map(String::from);
+    let developer_name = appstream.get("developer_name").and_then(|v| v.as_str()).map(String::from);
+    let homepage = appstream.get("urls").and_then(|u| u.get("homepage")).and_then(|v| v.as_str()).map(String::from);
+    (project_license, developer_name, homepage)
+}
+
+fn fetch_by_app_id(app_id: &str) -> Option<FlathubApp> {
+    let appstream = curl_json(&[&format!("{APPSTREAM_URL}/{app_id}")])?;
+    let (project_license, developer_name, homepage) = appstream_extras(&appstream);
+    Some(FlathubApp {
+        app_id: app_id.to_string(),
+        name: appstream.get("name")?.as_str()?.to_string(),
+        summary: appstream.get("summary").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
+        description: html_to_text(appstream.get("description").and_then(|d| d.as_str()).unwrap_or_default()),
+        icon: appstream.get("icon").and_then(|i| i.as_str()).map(String::from),
+        screenshots: parse_screenshots(&appstream),
+        project_license,
+        developer_name,
+        homepage,
+    })
+}
+
 fn find_hit(package_name: &str, term: &str) -> Option<serde_json::Value> {
     let query = serde_json::json!({ "query": term }).to_string();
     let results = curl_json(&[
@@ -260,9 +321,10 @@ fn fetch(package_name: &str) -> Option<FlathubApp> {
         .find_map(|term| find_hit(package_name, &term))?;
 
     let app_id = hit.get("app_id")?.as_str()?.to_string();
-    let screenshots = curl_json(&[&format!("{APPSTREAM_URL}/{app_id}")])
-        .map(|appstream| parse_screenshots(&appstream))
-        .unwrap_or_default();
+    let appstream = curl_json(&[&format!("{APPSTREAM_URL}/{app_id}")]);
+    let screenshots = appstream.as_ref().map(parse_screenshots).unwrap_or_default();
+    let (project_license, developer_name, homepage) =
+        appstream.as_ref().map(appstream_extras).unwrap_or_default();
 
     Some(FlathubApp {
         name: hit.get("name")?.as_str()?.to_string(),
@@ -273,6 +335,9 @@ fn fetch(package_name: &str) -> Option<FlathubApp> {
         icon: hit.get("icon").and_then(|i| i.as_str()).map(String::from),
         screenshots,
         app_id,
+        project_license,
+        developer_name,
+        homepage,
     })
 }
 
