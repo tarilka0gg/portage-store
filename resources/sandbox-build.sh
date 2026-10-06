@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installed as /usr/local/libexec/portage-store/sandbox-build.sh, root:root
+# Installed as /usr/libexec/portage-store/sandbox-build.sh, root:root
 # 0755. Previously this was written into the invoking user's own (user-
 # writable) XDG cache directory and executed from there — under a
 # passwordless privileged call, a tampered cache file would be silent,

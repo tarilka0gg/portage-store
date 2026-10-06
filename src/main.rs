@@ -3,7 +3,7 @@ mod ui;
 use adw::prelude::*;
 use gtk::gdk;
 
-const APP_ID: &str = "org.gentoo.PortageStore";
+const APP_ID: &str = "io.github.tarilka0gg.PortageStore";
 
 fn load_css() {
     let provider = gtk::CssProvider::new();

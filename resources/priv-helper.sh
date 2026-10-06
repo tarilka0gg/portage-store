@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installed as /usr/local/libexec/portage-store/priv-helper, root:root 0755,
+# Installed as /usr/libexec/portage-store/priv-helper, root:root 0755,
 # not writable by the app's own user. Invoked via a passwordless doas rule
 # (see /etc/doas.conf), so unlike the pkexec calls this replaces, there is
 # no authentication step at all standing between "the Rust binary asked for
@@ -14,7 +14,7 @@
 # could reach a `-c` argument and get executed as root with zero friction.
 set -euo pipefail
 
-HELPER_DIR="/usr/local/libexec/portage-store"
+HELPER_DIR="/usr/libexec/portage-store"
 TRACKED_DIR="/etc/portage"
 
 fail() {

@@ -25,7 +25,7 @@ pub const TRACKED_DIR: &str = "/etc/portage";
 /// scoping, the `emerge`/sandbox-build binary allowlist) and is the only
 /// thing a passwordless rule needs to trust, rather than trusting every
 /// caller in this binary to never mishandle a script string.
-pub const HELPER_PATH: &str = "/usr/local/libexec/portage-store/priv-helper";
+pub const HELPER_PATH: &str = "/usr/libexec/portage-store/priv-helper";
 
 /// Writes `content` to `path` as root. When `path` falls under
 /// `TRACKED_DIR`, the helper wraps the write in a git commit

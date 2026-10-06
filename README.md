@@ -248,11 +248,11 @@ open in your browser instead. Enable it with `--features webview` if you want it
 
 ```sh
 # 1. Install the helper scripts, root-owned and not writable by your user
-sudo mkdir -p /usr/local/libexec/portage-store
+sudo mkdir -p /usr/libexec/portage-store
 sudo install -m 0755 -o root -g root resources/priv-helper.sh \
-    /usr/local/libexec/portage-store/priv-helper
+    /usr/libexec/portage-store/priv-helper
 sudo install -m 0755 -o root -g root resources/sandbox-build.sh \
-    /usr/local/libexec/portage-store/sandbox-build.sh
+    /usr/libexec/portage-store/sandbox-build.sh
 
 # 2. Create its audit log
 sudo mkdir -p /var/log/portage-store
@@ -263,7 +263,7 @@ sudo chown root:portage /var/log/portage-store/priv-helper.log
 sudo chmod 0640 /var/log/portage-store/priv-helper.log
 
 # 3. Allow it to run without a password, for your user only
-echo "permit nopass $USER cmd /usr/local/libexec/portage-store/priv-helper" \
+echo "permit nopass $USER cmd /usr/libexec/portage-store/priv-helper" \
     | sudo tee -a /etc/doas.conf
 ```
 

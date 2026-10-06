@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>216761460+tarilka0gg@users.noreply.github.com</email>
+		<name>tarilka0gg</name>
+	</maintainer>
+	<longdescription>
+		A GTK4/libadwaita application store for Gentoo's Portage: search,
+		install and manage packages with a live job queue, USE-flag, keyword
+		and license conflict resolution, and checks for security advisories,
+		unread news, pending config updates, a stale tree and orphaned
+		packages. Ships a CLI companion (portage-store-cli). Privileged
+		operations go through a single root-owned helper behind one doas rule.
+	</longdescription>
+	<use>
+		<flag name="webview">Enable the in-app "Learn More" web view via net-libs/webkit-gtk (large dependency; links open in the system browser when off)</flag>
+	</use>
+	<upstream>
+		<remote-id type="github">tarilka0gg/portage-store</remote-id>
+		<bugs-to>https://github.com/tarilka0gg/portage-store/issues</bugs-to>
+	</upstream>
+</pkgmetadata>

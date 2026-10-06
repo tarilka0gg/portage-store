@@ -29,7 +29,7 @@ pub fn is_set_up() -> bool {
 
 /// The build script itself now lives only as `resources/sandbox-build.sh`
 /// in the repo (the reviewable source of truth) and, installed root-owned,
-/// at `/usr/local/libexec/portage-store/sandbox-build.sh` (see
+/// at `/usr/libexec/portage-store/sandbox-build.sh` (see
 /// `priv_write::HELPER_PATH`'s doc comment) — not duplicated here to avoid
 /// the two copies drifting. Under the old `pkexec` design this script got
 /// written to the user's own cache directory and executed from there,
@@ -38,7 +38,7 @@ pub fn is_set_up() -> bool {
 /// helper's own `sandbox-build <atom>` subcommand execs the installed copy
 /// directly, and an edit to `resources/sandbox-build.sh` needs a manual
 /// re-install to actually take effect (`install -o root -g root -m 0755
-/// resources/sandbox-build.sh /usr/local/libexec/portage-store/sandbox-build.sh`).
+/// resources/sandbox-build.sh /usr/libexec/portage-store/sandbox-build.sh`).
 ///
 /// Safety invariants that script is written to make structurally hard to
 /// violate, because it bind-mounts and overlay-mounts real host
