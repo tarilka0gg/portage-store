@@ -3,8 +3,7 @@
 
 EAPI=8
 
-RUST_MIN_VER="1.85"  # edition 2024
-
+RUST_MIN_VER="1.92"
 
 inherit cargo desktop git-r3 optfeature xdg
 
@@ -58,9 +57,11 @@ src_install() {
 	newexe resources/priv-helper.sh priv-helper
 	doexe resources/sandbox-build.sh
 
-	# The helper appends to its audit log; it only needs the directory
-	diropts -m0750 -o root -g portage
+	# The helper appends to its audit log; it only needs the directory.
+	# Group ownership (root:portage, so portage-group users can read the log) is set in
+	# pkg_postinst: it does not survive into the merged image from here.
 	keepdir /var/log/${PN}
+	fperms 0750 /var/log/${PN}
 
 	domenu packaging/io.github.tarilka0gg.PortageStore.desktop
 	insinto /usr/share/metainfo
@@ -72,6 +73,7 @@ src_install() {
 
 pkg_postinst() {
 	xdg_pkg_postinst
+	chgrp portage "${EROOT}/var/log/${PN}" || ewarn "could not set the group of /var/log/${PN}"
 	optfeature "Flatpak lane (apps outside the tree)" sys-apps/flatpak
 
 	elog "portage-store needs a passwordless doas rule for its privileged helper,"
