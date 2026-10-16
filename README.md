@@ -207,7 +207,7 @@ collapsed strip beneath the Portage results, never mixed into them.
 
 ## Requirements
 
-**Build:** Rust 1.85+ (2024 edition; developed against 1.96), `gui-libs/gtk` 4.12+,
+**Build:** Rust 1.92+ (2024 edition; what the Gentoo ebuild requires, developed against 1.96), `gui-libs/gtk` 4.12+,
 `gui-libs/libadwaita` 1.5+.
 
 **Runtime:**
