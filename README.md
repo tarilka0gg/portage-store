@@ -42,32 +42,32 @@ portage-store-cli      # the same core, no window
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/onboarding.png" alt="The first-run welcome: a quick scan of the system and starter bundles" width="100%"></td>
-    <td width="50%"><img src="docs/screenshots/explore.png" alt="The Explore landing page: category tiles above themed carousels" width="100%"></td>
+    <td width="50%"><a href="docs/screenshots/onboarding.png"><img src="docs/screenshots/onboarding.png" alt="The first-run welcome: a quick scan of the system and starter bundles" width="100%"></a></td>
+    <td width="50%"><a href="docs/screenshots/explore.png"><img src="docs/screenshots/explore.png" alt="The Explore landing page: category tiles above themed carousels" width="100%"></a></td>
   </tr>
   <tr>
     <td><b>First run</b><br><sub>What is installed, pending updates and orphans, plus optional starter bundles.</sub></td>
     <td><b>Explore</b><br><sub>Category tiles above themed carousels of packages.</sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/search.png" alt="Search results for gimp, installed packages marked" width="100%"></td>
-    <td width="50%"><img src="docs/screenshots/detail.png" alt="A package page with upstream screenshots" width="100%"></td>
+    <td width="50%"><a href="docs/screenshots/search.png"><img src="docs/screenshots/search.png" alt="Search results for gimp, installed packages marked" width="100%"></a></td>
+    <td width="50%"><a href="docs/screenshots/detail.png"><img src="docs/screenshots/detail.png" alt="A package page with upstream screenshots" width="100%"></a></td>
   </tr>
   <tr>
     <td><b>Search</b><br><sub>Name and description matches, ranked; installed packages carry a check mark.</sub></td>
     <td><b>Package detail</b><br><sub>Upstream screenshots, a description and the Install / Remove button.</sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/detail-screenshot-viewer.png" alt="An upstream screenshot opened full-size in place" width="100%"></td>
-    <td width="50%"><img src="docs/screenshots/detail-info.png" alt="Package details, links and the build options below" width="100%"></td>
+    <td width="50%"><a href="docs/screenshots/detail-screenshot-viewer.png"><img src="docs/screenshots/detail-screenshot-viewer.png" alt="An upstream screenshot opened full-size in place" width="100%"></a></td>
+    <td width="50%"><a href="docs/screenshots/detail-info.png"><img src="docs/screenshots/detail-info.png" alt="Package details, links and the build options below" width="100%"></a></td>
   </tr>
   <tr>
     <td><b>Screenshot viewer</b><br><sub>Upstream screenshots open full-size in place.</sub></td>
     <td><b>Details</b><br><sub>License, slot, upstream links, the bug tracker and why a package is installed.</sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/use-flags.png" alt="The USE flag editor, one switch per flag" width="100%"></td>
-    <td width="50%"><img src="docs/screenshots/updates.png" alt="The Updates tab with the pending packages" width="100%"></td>
+    <td width="50%"><a href="docs/screenshots/use-flags.png"><img src="docs/screenshots/use-flags.png" alt="The USE flag editor, one switch per flag" width="100%"></a></td>
+    <td width="50%"><a href="docs/screenshots/updates.png"><img src="docs/screenshots/updates.png" alt="The Updates tab with the pending packages" width="100%"></a></td>
   </tr>
   <tr>
     <td><b>Build options</b><br><sub>Every USE flag with its description, and how many other installed packages share it.</sub></td>
