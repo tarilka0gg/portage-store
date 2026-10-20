@@ -1,7 +1,6 @@
 # Portage Store
 
-[![Latest release](https://img.shields.io/github/v/release/tarilka0gg/portage-store)](https://github.com/tarilka0gg/portage-store/releases/latest)
-[![License: GPL-2.0](https://img.shields.io/badge/license-GPL--2.0-blue)](LICENSE)
+[![CI](https://github.com/tarilka0gg/portage-store/actions/workflows/ci.yml/badge.svg)](https://github.com/tarilka0gg/portage-store/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/tarilka0gg/portage-store)](LICENSE) [![Release](https://img.shields.io/github/v/release/tarilka0gg/portage-store)](https://github.com/tarilka0gg/portage-store/releases) [![Changelog](https://img.shields.io/badge/changelog-CHANGELOG.md-blue)](CHANGELOG.md)
 
 A GTK4/libadwaita application store for Gentoo's Portage package manager, plus a
 terminal companion that shares the same core.
@@ -362,6 +361,10 @@ correct** — `packaging/README.md` lists exactly what needs fixing first, inclu
 real helper-path mismatch between the ebuild and the compiled-in constant.
 
 ---
+
+## Changelog
+
+What changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
